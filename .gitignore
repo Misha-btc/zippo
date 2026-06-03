@@ -1,0 +1,20 @@
+target/
+target-*/
+Cargo.lock.bak
+
+# Local dev scripts (regtest harness — environment-specific)
+scripts/
+
+# OS
+.DS_Store
+**/.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+
+# Claude tooling
+.claude/
