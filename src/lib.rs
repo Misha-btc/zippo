@@ -16,12 +16,15 @@
 //!   100 MadeIn             — view: returns "Winnipeg"
 //!
 //! Baseline ZapIn flow:
-//!   1. Sort the pair into the pool's canonical order (smaller → `/alkane/0`).
-//!   2. Read reserves (97) and fee (20).
-//!   3. Compute the optimal swap `s` via the quadratic formula.
-//!   4. Swap `s` input → output directly on the pool (opcode 3).
-//!   5. Call AddLiquidity (opcode 1) with the proportionally-capped deposit.
-//!   6. Return the LP + dust + any other incoming tokens to the caller.
+//!   1. Read pool state once (PoolDetails 999 + GetTotalFee 20) and
+//!      validate that the caller's pair matches the pool's pair.
+//!   2. Compute the optimal swap `s` via the quadratic formula.
+//!   3. Swap `s` input → output directly on the pool (opcode 3).
+//!   4. Call AddLiquidity (opcode 1) with the proportionally-capped deposit.
+//!   5. Return the LP + dust + any other incoming tokens to the caller.
+//!
+//! Every mutating opcode takes a `deadline` (block height): `0` disables
+//! the check, any other value reverts the call once `height > deadline`.
 
 use alkanes_runtime::{
     declare_alkane, message::MessageDispatch, runtime::AlkaneResponder,
@@ -37,8 +40,6 @@ use metashrew_support::compat::to_arraybuffer_layout;
 
 pub mod amm_logic;
 
-const DEFAULT_FEE_PER_1000: u128 = 10;
-
 // ─── Message Dispatch ────────────────────────────────────────────────
 
 #[derive(MessageDispatch)]
@@ -46,6 +47,8 @@ pub enum ZapMessage {
     /// Single-side zap → LP.
     /// `input_token` is what the caller sends in incoming.
     /// `output_token` is the other side of the pool (used for swap output).
+    /// Both must match the pool's pair exactly, otherwise the call
+    /// reverts up front.
     /// `amount_in` is the exact amount of `input_token` to zap. Must be
     /// `> 0` and `≤ total_incoming` (matching the `oyl-amm factory`
     /// convention). Excess `total_incoming − amount_in` is returned to
@@ -53,6 +56,7 @@ pub enum ZapMessage {
     /// `_return_leftovers`).
     /// Any other tokens in incoming (including a stray `output_token`)
     /// are returned untouched.
+    /// `deadline` is a block height; `0` disables the expiry check.
     #[opcode(1)]
     ZapIn {
         pool: AlkaneId,
@@ -123,12 +127,14 @@ pub enum ZapMessage {
     },
 
     /// Exact-out variant of `ZapInAndStake`: the caller asks to stake
-    /// **exactly** `lp_out` LP in the FIRE staking contract. The contract
-    /// derives the minimum `amount_in` via the closed-form inverse
-    /// formula, reverts if it would exceed `amount_in_max`, otherwise
-    /// runs the zap and forwards exactly `lp_out` LP into staking.
-    /// Unused `amount_in_max − amount_in` is refunded as change.
-    /// `lock_duration` is whitelist-validated (same set as opcode 4).
+    /// **at least** `lp_out` LP in the FIRE staking contract. The
+    /// contract derives the minimum `amount_in` via the closed-form
+    /// inverse formula, reverts if it would exceed `amount_in_max`,
+    /// otherwise runs the zap and forwards all minted LP (≥ `lp_out` —
+    /// ceil rounding can mint a hair more, and staking the surplus
+    /// avoids orphaning LP dust). Unused `amount_in_max − amount_in`
+    /// is refunded as change. `lock_duration` is whitelist-validated
+    /// (same set as opcode 4).
     #[opcode(9)]
     ZapInAndStakeForExactLp {
         pool: AlkaneId,
@@ -141,9 +147,10 @@ pub enum ZapMessage {
         deadline: u128,
     },
 
-    /// Exact-out variant of `ZapInAndBond`: stake **exactly** `lp_out`
-    /// LP into the FIRE bonding contract. Closed-form inverse derives
-    /// the minimum `amount_in`; reverts if > `amount_in_max`. Caller
+    /// Exact-out variant of `ZapInAndBond`: bond **at least** `lp_out`
+    /// LP into the FIRE bonding contract (all minted LP is forwarded,
+    /// ≥ `lp_out` by ceil rounding). Closed-form inverse derives the
+    /// minimum `amount_in`; reverts if > `amount_in_max`. Caller
     /// receives bond NFT + immediate FIRE (if any) + residuals + change.
     #[opcode(10)]
     ZapInAndBondForExactLp {
@@ -245,9 +252,11 @@ pub struct Zap();
 impl AlkaneResponder for Zap {}
 
 /// Decomposition of a zap-to-LP result: LP minted, residuals after the
-/// proportional cap, and leftovers from incoming. Wrappers decide how to
-/// package this — `zap_in` returns LP to the caller, `zap_in_and_stake`
-/// forwards it into staking, `zap_in_and_bond` into bonding, etc.
+/// proportional cap, and leftovers from incoming (plus anything the
+/// pool returned that we didn't expect — swept so nothing strands in
+/// this stateless contract). Wrappers decide how to package this —
+/// `zap_in` returns LP to the caller, `zap_in_and_stake` forwards it
+/// into staking, `zap_in_and_bond` into bonding, etc.
 struct ZapInResult {
     lp_received: u128,
     pool: AlkaneId,
@@ -256,6 +265,19 @@ struct ZapInResult {
     residual_input: u128,
     residual_output: u128,
     leftovers: Vec<AlkaneTransfer>,
+}
+
+/// Snapshot of pool state, read once per call (PoolDetails + fee).
+/// `token_a` is the pool's `/alkane/0` side (canonical order), so
+/// `reserve_a`/`reserve_b` line up with the swap opcode's
+/// `amount_0_out`/`amount_1_out`.
+struct PoolState {
+    token_a: AlkaneId,
+    token_b: AlkaneId,
+    reserve_a: u128,
+    reserve_b: u128,
+    total_supply: u128,
+    fee_per_1000: u128,
 }
 
 /// Collapse repeated AlkaneId entries in a transfer list into a single
@@ -275,6 +297,15 @@ fn aggregate_transfers(transfers: Vec<AlkaneTransfer>) -> Vec<AlkaneTransfer> {
         .filter(|(_, v)| *v > 0)
         .map(|(id, value)| AlkaneTransfer { id, value })
         .collect()
+}
+
+/// Assemble a `CallResponse` from a transfer list (duplicates collapsed)
+/// and return data.
+fn make_response(transfers: Vec<AlkaneTransfer>, data: Vec<u8>) -> CallResponse {
+    CallResponse {
+        alkanes: AlkaneTransferParcel(aggregate_transfers(transfers)),
+        data,
+    }
 }
 
 /// Whitelist for FIRE staking `lock_duration`. Only the exact values from
@@ -300,58 +331,80 @@ fn validate_lock_duration(lock_duration: u128) -> Result<()> {
     }
 }
 
-/// Canonical pool token ordering — same convention as the oyl-amm factory
-/// (the smaller AlkaneId maps to `/alkane/0`).
-fn sort_alkanes(a: AlkaneId, b: AlkaneId) -> (AlkaneId, AlkaneId) {
-    if a < b { (a, b) } else { (b, a) }
+/// Check that `{input_token, output_token}` is exactly the pool's pair
+/// and return `true` when `input_token` is the `token_a` (`/alkane/0`)
+/// side. A mismatched pair reverts here, before any tokens move —
+/// instead of surfacing as an opaque pool-side error mid-zap.
+fn orient_pair(
+    input_token: AlkaneId,
+    output_token: AlkaneId,
+    state: &PoolState,
+) -> Result<bool> {
+    if input_token == state.token_a && output_token == state.token_b {
+        Ok(true)
+    } else if input_token == state.token_b && output_token == state.token_a {
+        Ok(false)
+    } else {
+        Err(anyhow!(
+            "tokens ({:?}, {:?}) do not match pool pair ({:?}, {:?})",
+            input_token, output_token, state.token_a, state.token_b
+        ))
+    }
 }
 
 impl Zap {
     // ── Pool queries ─────────────────────────────────────────────────
 
-    /// GetReserves (opcode 97) → `(reserve_0, reserve_1)`.
-    fn query_reserves(&self, pool: AlkaneId) -> Result<(u128, u128)> {
-        let resp = self.staticcall(
-            &Cellpack { target: pool, inputs: vec![97] },
-            &AlkaneTransferParcel::default(),
-            self.fuel(),
-        )?;
-        if resp.data.len() < 32 {
-            return Err(anyhow!("GetReserves too short: {}", resp.data.len()));
-        }
-        let r0 = u128::from_le_bytes(resp.data[0..16].try_into().unwrap());
-        let r1 = u128::from_le_bytes(resp.data[16..32].try_into().unwrap());
-        Ok((r0, r1))
-    }
-
-    /// PoolDetails (opcode 999) → parsed `total_supply`. Needed only by
-    /// `ZapInForExactLp` for the exact-`amount_in` inverse formula —
-    /// the oyl-amm pool has no dedicated getter for `total_supply`.
-    fn query_total_supply(&self, pool: AlkaneId) -> Result<u128> {
+    /// Read the full pool snapshot: PoolDetails (opcode 999) for the
+    /// pair, reserves, and total supply, plus GetTotalFee (opcode 20).
+    /// Two staticcalls — every mutating opcode needs all of it, and
+    /// PoolDetails subsumes the old separate GetReserves(97) /
+    /// total-supply reads.
+    fn read_pool_state(&self, pool: AlkaneId) -> Result<PoolState> {
         let resp = self.staticcall(
             &Cellpack { target: pool, inputs: vec![999] },
             &AlkaneTransferParcel::default(),
             self.fuel(),
         )?;
         if resp.data.len() < 112 {
-            return Err(anyhow!("PoolDetails too short for total_supply"));
+            return Err(anyhow!("PoolDetails too short: {}", resp.data.len()));
         }
-        Ok(u128::from_le_bytes(resp.data[96..112].try_into().unwrap()))
+        let token_a = AlkaneId {
+            block: u128::from_le_bytes(resp.data[0..16].try_into().unwrap()),
+            tx: u128::from_le_bytes(resp.data[16..32].try_into().unwrap()),
+        };
+        let token_b = AlkaneId {
+            block: u128::from_le_bytes(resp.data[32..48].try_into().unwrap()),
+            tx: u128::from_le_bytes(resp.data[48..64].try_into().unwrap()),
+        };
+        let reserve_a = u128::from_le_bytes(resp.data[64..80].try_into().unwrap());
+        let reserve_b = u128::from_le_bytes(resp.data[80..96].try_into().unwrap());
+        let total_supply = u128::from_le_bytes(resp.data[96..112].try_into().unwrap());
+        let fee_per_1000 = self.query_fee_per_1000(pool)?;
+        Ok(PoolState {
+            token_a,
+            token_b,
+            reserve_a,
+            reserve_b,
+            total_supply,
+            fee_per_1000,
+        })
     }
 
-    /// GetTotalFee (opcode 20) → `fee_per_1000`. Falls back to default.
-    fn query_fee_per_1000(&self, pool: AlkaneId) -> u128 {
+    /// GetTotalFee (opcode 20) → `fee_per_1000`. A failed or malformed
+    /// read is a hard error: silently assuming a default fee would make
+    /// the swap under-ask (donating the difference to the pool) whenever
+    /// the real fee is lower, or revert opaquely whenever it's higher.
+    fn query_fee_per_1000(&self, pool: AlkaneId) -> Result<u128> {
         let resp = self.staticcall(
             &Cellpack { target: pool, inputs: vec![20] },
             &AlkaneTransferParcel::default(),
             self.fuel(),
-        );
-        match resp {
-            Ok(r) if r.data.len() >= 16 => {
-                u128::from_le_bytes(r.data[0..16].try_into().unwrap())
-            }
-            _ => DEFAULT_FEE_PER_1000,
+        )?;
+        if resp.data.len() < 16 {
+            return Err(anyhow!("GetTotalFee response too short: {}", resp.data.len()));
         }
+        Ok(u128::from_le_bytes(resp.data[0..16].try_into().unwrap()))
     }
 
     // ── Pool calls ───────────────────────────────────────────────────
@@ -415,8 +468,57 @@ impl Zap {
         self.call(&cellpack, &parcel, self.fuel())
     }
 
+    /// Forwards `lp_amount` LP into `staking` opcode 1
+    /// (`Stake { lock_duration, amount }`). Returns the staking response
+    /// (typically the position NFT). Used by opcodes 4 (ZapInAndStake),
+    /// 7 (Stake), and 9 (ZapInAndStakeForExactLp).
+    fn call_staking(
+        &self,
+        staking: AlkaneId,
+        pool: AlkaneId,
+        lp_amount: u128,
+        lock_duration: u128,
+    ) -> Result<CallResponse> {
+        self.call(
+            &Cellpack {
+                target: staking,
+                inputs: vec![1, lock_duration, lp_amount],
+            },
+            &AlkaneTransferParcel(vec![AlkaneTransfer {
+                id: pool,
+                value: lp_amount,
+            }]),
+            self.fuel(),
+        )
+    }
+
+    /// Forwards `lp_amount` LP into `bonding` opcode 1
+    /// (`Bond { lp_to_bond, min_fire_out }`). Used by opcodes 5
+    /// (ZapInAndBond), 8 (Bond), and 10 (ZapInAndBondForExactLp).
+    fn call_bonding(
+        &self,
+        bonding: AlkaneId,
+        pool: AlkaneId,
+        lp_amount: u128,
+        min_fire_out: u128,
+    ) -> Result<CallResponse> {
+        self.call(
+            &Cellpack {
+                target: bonding,
+                inputs: vec![1, lp_amount, min_fire_out],
+            },
+            &AlkaneTransferParcel(vec![AlkaneTransfer {
+                id: pool,
+                value: lp_amount,
+            }]),
+            self.fuel(),
+        )
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────
 
+    /// `deadline == 0` disables the check; any other value reverts the
+    /// call once the current block height exceeds it.
     fn check_deadline(&self, deadline: u128) -> Result<()> {
         if deadline != 0 && (self.height() as u128) > deadline {
             return Err(anyhow!(
@@ -449,16 +551,16 @@ impl Zap {
             if tr.id == input_token {
                 total_in = total_in.saturating_add(tr.value);
             } else {
-                leftovers.push(tr.clone());
+                leftovers.push(*tr);
             }
         }
         if total_in == 0 {
-            return Err(anyhow!("input_token not present in incoming"));
+            return Err(anyhow!("input token {:?} not present in incoming", input_token));
         }
         if amount_in > total_in {
             return Err(anyhow!(
-                "amount_in {} > available input {}",
-                amount_in, total_in
+                "required input {} exceeds {} received of token {:?}",
+                amount_in, total_in, input_token
             ));
         }
         let excess = total_in - amount_in;
@@ -471,53 +573,142 @@ impl Zap {
         Ok((amount_in, leftovers))
     }
 
-    // ── Opcode handlers ──────────────────────────────────────────────
+    /// Package a zap-to-LP result for the caller: `transfers` carries
+    /// the op-specific payload (the LP itself for plain zaps, the
+    /// staking/bonding response for forwarding ops); residuals and
+    /// leftovers are appended, duplicates collapsed. `data` is the
+    /// minted LP amount (16 LE bytes) followed by `extra_data` (the
+    /// sub-call's response data, so bond/stake results stay visible
+    /// in traces).
+    fn package_zap_response(
+        r: ZapInResult,
+        mut transfers: Vec<AlkaneTransfer>,
+        extra_data: &[u8],
+    ) -> CallResponse {
+        if r.residual_input > 0 {
+            transfers.push(AlkaneTransfer {
+                id: r.input_token,
+                value: r.residual_input,
+            });
+        }
+        if r.residual_output > 0 {
+            transfers.push(AlkaneTransfer {
+                id: r.output_token,
+                value: r.residual_output,
+            });
+        }
+        transfers.extend(r.leftovers);
 
-    fn zap_in(
+        let mut data = Vec::with_capacity(16 + extra_data.len());
+        data.extend_from_slice(&r.lp_received.to_le_bytes());
+        data.extend_from_slice(extra_data);
+
+        make_response(transfers, data)
+    }
+
+    /// Derive the minimum `amount_in` for an exact-LP target (shared
+    /// preamble of opcodes 2, 9, 10): read pool state, validate the
+    /// pair, run the closed-form inverse, and enforce `amount_in_max`.
+    fn derive_exact_lp_input(
+        &self,
+        pool: AlkaneId,
+        input_token: AlkaneId,
+        output_token: AlkaneId,
+        lp_out: u128,
+        amount_in_max: u128,
+    ) -> Result<(u128, PoolState)> {
+        if lp_out == 0 {
+            return Err(anyhow!("lp_out must be > 0"));
+        }
+        if amount_in_max == 0 {
+            return Err(anyhow!("amount_in_max must be > 0"));
+        }
+        let state = self.read_pool_state(pool)?;
+        let input_is_a = orient_pair(input_token, output_token, &state)?;
+        if state.reserve_a == 0 || state.reserve_b == 0 {
+            return Err(anyhow!("pool not seeded — single-side zap impossible"));
+        }
+        if state.total_supply == 0 {
+            return Err(anyhow!("pool total_supply is zero"));
+        }
+        let r_in = if input_is_a { state.reserve_a } else { state.reserve_b };
+        let (amount_in, _) = amm_logic::calculate_amount_in_for_exact_lp(
+            lp_out, r_in, state.total_supply, state.fee_per_1000,
+        )?;
+        if amount_in > amount_in_max {
+            return Err(anyhow!(
+                "required amount_in {} > amount_in_max {}",
+                amount_in, amount_in_max
+            ));
+        }
+        Ok((amount_in, state))
+    }
+
+    // ── Core zap-to-LP ───────────────────────────────────────────────
+
+    /// Core zap-to-LP logic that does *not* build a `CallResponse`. It
+    /// returns the components so callers can decide where the LP goes —
+    /// hand it back to the user (as in `zap_in`) or forward it into a
+    /// staking/bonding contract. Thin wrapper: reads pool state and
+    /// delegates to `_with_state`.
+    fn execute_zap_to_lp(
         &self,
         pool: AlkaneId,
         input_token: AlkaneId,
         output_token: AlkaneId,
         amount_in: u128,
         min_lp_tokens: u128,
-        deadline: u128,
-    ) -> Result<CallResponse> {
-        self.check_deadline(deadline)?;
-        if input_token == output_token {
-            return Err(anyhow!("input_token == output_token"));
-        }
+    ) -> Result<ZapInResult> {
+        let state = self.read_pool_state(pool)?;
+        self.execute_zap_to_lp_with_state(
+            pool, input_token, output_token, amount_in, min_lp_tokens, &state,
+        )
+    }
 
-        // Sort into the pool's canonical order and remember which side is input.
-        let (token_0, token_1) = sort_alkanes(input_token, output_token);
-        let input_is_0 = input_token == token_0;
-
-        let (reserve_0, reserve_1) = self.query_reserves(pool)?;
-        if reserve_0 == 0 || reserve_1 == 0 {
+    /// "Hot path" without duplicate pool reads — used when the caller
+    /// (`zap_in_for_exact_lp` and derivatives) has already read the
+    /// pool state for its own math. Within a single runtime invocation
+    /// pool state is immutable between our mutate ops, so reusing the
+    /// snapshot is safe.
+    ///
+    /// Anything the pool returns beyond the expected swap output / LP
+    /// (e.g. deposit change) is swept into leftovers — this contract is
+    /// stateless, so a dropped transfer would strand tokens forever.
+    fn execute_zap_to_lp_with_state(
+        &self,
+        pool: AlkaneId,
+        input_token: AlkaneId,
+        output_token: AlkaneId,
+        amount_in: u128,
+        min_lp_tokens: u128,
+        state: &PoolState,
+    ) -> Result<ZapInResult> {
+        let input_is_a = orient_pair(input_token, output_token, state)?;
+        if state.reserve_a == 0 || state.reserve_b == 0 {
             return Err(anyhow!("pool not seeded — single-side zap impossible"));
         }
-        let fee = self.query_fee_per_1000(pool);
 
-        let (amount_in, leftovers) = self.extract_input(input_token, amount_in)?;
+        let (amount_in, mut leftovers) = self.extract_input(input_token, amount_in)?;
 
-        // Reserves on the input / output side.
-        let (reserve_in, reserve_out) = if input_is_0 {
-            (reserve_0, reserve_1)
+        let (reserve_in, reserve_out) = if input_is_a {
+            (state.reserve_a, state.reserve_b)
         } else {
-            (reserve_1, reserve_0)
+            (state.reserve_b, state.reserve_a)
         };
 
-        // 1) Optimal swap.
-        let swap_amount =
-            amm_logic::calculate_single_side_swap(amount_in, reserve_in, fee);
+        // 1) Optimal swap split.
+        let swap_amount = amm_logic::calculate_single_side_swap(
+            amount_in, reserve_in, state.fee_per_1000,
+        );
         if swap_amount == 0 {
             return Err(anyhow!("amount_in too small to compute optimal swap split"));
         }
 
         // 2) Swap input → output. amount_0_out / amount_1_out follow pool ordering.
         let expected_out = amm_logic::calculate_swap_out(
-            swap_amount, reserve_in, reserve_out, fee,
+            swap_amount, reserve_in, reserve_out, state.fee_per_1000,
         )?;
-        let (amt_0_out, amt_1_out) = if input_is_0 {
+        let (amt_0_out, amt_1_out) = if input_is_a {
             (0u128, expected_out)
         } else {
             (expected_out, 0u128)
@@ -530,6 +721,8 @@ impl Zap {
         for tr in &swap_resp.alkanes.0 {
             if tr.id == output_token {
                 got_output = got_output.saturating_add(tr.value);
+            } else {
+                leftovers.push(*tr); // unexpected refund — back to caller
             }
         }
         if got_output == 0 {
@@ -558,257 +751,21 @@ impl Zap {
         }
 
         // 4) AddLiquidity — pass amounts in pool order.
-        let (amount_0_dep, amount_1_dep) = if input_is_0 {
+        let (amount_a_dep, amount_b_dep) = if input_is_a {
             (deposit_input, deposit_output)
         } else {
             (deposit_output, deposit_input)
         };
         let add_resp = self.call_add_liquidity(
-            pool, token_0, amount_0_dep, token_1, amount_1_dep,
+            pool, state.token_a, amount_a_dep, state.token_b, amount_b_dep,
         )?;
 
-        // 5) Assemble the result: LP + dust + leftovers.
-        let mut response = CallResponse::default();
         let mut lp_received = 0u128;
         for tr in &add_resp.alkanes.0 {
             if tr.id == pool {
                 lp_received = lp_received.saturating_add(tr.value);
-            }
-            response.alkanes.0.push(tr.clone());
-        }
-        if lp_received < min_lp_tokens {
-            return Err(anyhow!(
-                "insufficient LP: got {}, want >= {}",
-                lp_received,
-                min_lp_tokens
-            ));
-        }
-
-        // Change goes back to the caller.
-        let residual_input = have_input.saturating_sub(deposit_input);
-        let residual_output = have_output.saturating_sub(deposit_output);
-        if residual_input > 0 {
-            response.alkanes.0.push(AlkaneTransfer {
-                id: input_token,
-                value: residual_input,
-            });
-        }
-        if residual_output > 0 {
-            response.alkanes.0.push(AlkaneTransfer {
-                id: output_token,
-                value: residual_output,
-            });
-        }
-
-        // Other incoming tokens — return them untouched.
-        for tr in leftovers {
-            response.alkanes.0.push(tr);
-        }
-
-        response.alkanes.0 = aggregate_transfers(response.alkanes.0);
-
-        let mut data = Vec::with_capacity(16);
-        data.extend_from_slice(&lp_received.to_le_bytes());
-        response.data = data;
-        Ok(response)
-    }
-
-    fn zap_in_for_exact_lp(
-        &self,
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        lp_out: u128,
-        amount_in_max: u128,
-        deadline: u128,
-    ) -> Result<CallResponse> {
-        self.check_deadline(deadline)?;
-        if input_token == output_token {
-            return Err(anyhow!("input_token == output_token"));
-        }
-        if lp_out == 0 {
-            return Err(anyhow!("lp_out must be > 0"));
-        }
-        if amount_in_max == 0 {
-            return Err(anyhow!("amount_in_max must be > 0"));
-        }
-
-        let (token_0, _token_1) = sort_alkanes(input_token, output_token);
-        let input_is_0 = input_token == token_0;
-
-        let (reserve_0, reserve_1) = self.query_reserves(pool)?;
-        if reserve_0 == 0 || reserve_1 == 0 {
-            return Err(anyhow!("pool not seeded — single-side zap impossible"));
-        }
-        let fee = self.query_fee_per_1000(pool);
-        let total_supply = self.query_total_supply(pool)?;
-        if total_supply == 0 {
-            return Err(anyhow!("pool total_supply is zero"));
-        }
-
-        let r_in = if input_is_0 { reserve_0 } else { reserve_1 };
-
-        // Closed-form: derive the exact amount_in needed for the target LP.
-        let (amount_in, _) = amm_logic::calculate_amount_in_for_exact_lp(
-            lp_out, r_in, total_supply, fee,
-        )?;
-
-        if amount_in > amount_in_max {
-            return Err(anyhow!(
-                "required amount_in {} > amount_in_max {}",
-                amount_in, amount_in_max
-            ));
-        }
-
-        // Reuse the already-read reserves+fee (state is immutable until
-        // the swap fires) — call `_with_state` instead of reading them a
-        // second time (saves 2 staticcalls ≈ 175K fuel).
-        let r = self.execute_zap_to_lp_with_state(
-            pool, input_token, output_token, amount_in, lp_out,
-            reserve_0, reserve_1, fee,
-        )?;
-
-        // Build the response: LP + residuals + leftovers (same shape as opcode 1).
-        let mut response = CallResponse::default();
-        response.alkanes.0.push(AlkaneTransfer {
-            id: r.pool,
-            value: r.lp_received,
-        });
-        if r.residual_input > 0 {
-            response.alkanes.0.push(AlkaneTransfer {
-                id: r.input_token,
-                value: r.residual_input,
-            });
-        }
-        if r.residual_output > 0 {
-            response.alkanes.0.push(AlkaneTransfer {
-                id: r.output_token,
-                value: r.residual_output,
-            });
-        }
-        for tr in r.leftovers {
-            response.alkanes.0.push(tr);
-        }
-        response.alkanes.0 = aggregate_transfers(response.alkanes.0);
-
-        let mut data = Vec::with_capacity(16);
-        data.extend_from_slice(&r.lp_received.to_le_bytes());
-        response.data = data;
-        Ok(response)
-    }
-
-    /// Core zap-to-LP logic that does *not* build a `CallResponse`. It
-    /// returns the components so callers can decide where the LP goes —
-    /// hand it back to the user (as in `zap_in`) or forward it into a
-    /// staking/bonding contract. Thin wrapper: reads pool state
-    /// (reserves, fee) and delegates to `_with_state`.
-    fn execute_zap_to_lp(
-        &self,
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        amount_in: u128,
-        min_lp_tokens: u128,
-    ) -> Result<ZapInResult> {
-        let (reserve_0, reserve_1) = self.query_reserves(pool)?;
-        if reserve_0 == 0 || reserve_1 == 0 {
-            return Err(anyhow!("pool not seeded — single-side zap impossible"));
-        }
-        let fee = self.query_fee_per_1000(pool);
-        self.execute_zap_to_lp_with_state(
-            pool, input_token, output_token, amount_in, min_lp_tokens,
-            reserve_0, reserve_1, fee,
-        )
-    }
-
-    /// "Hot path" without duplicate pool reads — used when the caller
-    /// (`zap_in_for_exact_lp` and derivatives) has already read
-    /// reserves+fee for its own math. Within a single runtime invocation
-    /// pool state is immutable between our mutate ops, so reusing the
-    /// snapshot is safe.
-    fn execute_zap_to_lp_with_state(
-        &self,
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        amount_in: u128,
-        min_lp_tokens: u128,
-        reserve_0: u128,
-        reserve_1: u128,
-        fee: u128,
-    ) -> Result<ZapInResult> {
-        let (token_0, token_1) = sort_alkanes(input_token, output_token);
-        let input_is_0 = input_token == token_0;
-
-        let (amount_in, leftovers) = self.extract_input(input_token, amount_in)?;
-
-        let (reserve_in, reserve_out) = if input_is_0 {
-            (reserve_0, reserve_1)
-        } else {
-            (reserve_1, reserve_0)
-        };
-
-        let swap_amount =
-            amm_logic::calculate_single_side_swap(amount_in, reserve_in, fee);
-        if swap_amount == 0 {
-            return Err(anyhow!("amount_in too small to compute optimal swap split"));
-        }
-
-        let expected_out = amm_logic::calculate_swap_out(
-            swap_amount, reserve_in, reserve_out, fee,
-        )?;
-        let (amt_0_out, amt_1_out) = if input_is_0 {
-            (0u128, expected_out)
-        } else {
-            (expected_out, 0u128)
-        };
-        let swap_resp = self.call_swap(
-            pool, input_token, swap_amount, amt_0_out, amt_1_out,
-        )?;
-
-        let mut got_output = 0u128;
-        for tr in &swap_resp.alkanes.0 {
-            if tr.id == output_token {
-                got_output = got_output.saturating_add(tr.value);
-            }
-        }
-        if got_output == 0 {
-            return Err(anyhow!("pool swap returned 0 output (input too small or pool degenerate)"));
-        }
-
-        let have_input = amount_in - swap_amount;
-        let have_output = got_output;
-        let new_reserve_in = reserve_in.saturating_add(swap_amount);
-        let new_reserve_out = reserve_out.saturating_sub(got_output);
-
-        let (deposit_input, deposit_output) = {
-            let out_for_in =
-                amm_logic::mul_div(have_input, new_reserve_out, new_reserve_in);
-            if out_for_in <= have_output {
-                (have_input, out_for_in)
             } else {
-                let in_for_out =
-                    amm_logic::mul_div(have_output, new_reserve_in, new_reserve_out);
-                (in_for_out, have_output)
-            }
-        };
-        if deposit_input == 0 || deposit_output == 0 {
-            return Err(anyhow!("computed deposit is zero on one side (amount_in too small for this pool)"));
-        }
-
-        let (amount_0_dep, amount_1_dep) = if input_is_0 {
-            (deposit_input, deposit_output)
-        } else {
-            (deposit_output, deposit_input)
-        };
-        let add_resp = self.call_add_liquidity(
-            pool, token_0, amount_0_dep, token_1, amount_1_dep,
-        )?;
-
-        let mut lp_received = 0u128;
-        for tr in &add_resp.alkanes.0 {
-            if tr.id == pool {
-                lp_received = lp_received.saturating_add(tr.value);
+                leftovers.push(*tr); // deposit change from the pool — back to caller
             }
         }
         if lp_received < min_lp_tokens {
@@ -833,55 +790,58 @@ impl Zap {
         })
     }
 
-    /// Forwards `lp_amount` LP into `staking` opcode 1
-    /// (`Stake { lock_duration, amount }`). Returns the staking response
-    /// (typically the position NFT). Used by opcodes 4 (ZapInAndStake)
-    /// and 7 (Stake).
-    fn call_staking(
+    // ── ZapIn (opcode 1) ─────────────────────────────────────────────
+
+    fn zap_in(
         &self,
-        staking: AlkaneId,
         pool: AlkaneId,
-        lp_amount: u128,
-        lock_duration: u128,
+        input_token: AlkaneId,
+        output_token: AlkaneId,
+        amount_in: u128,
+        min_lp_tokens: u128,
+        deadline: u128,
     ) -> Result<CallResponse> {
-        self.call(
-            &Cellpack {
-                target: staking,
-                inputs: vec![1, lock_duration, lp_amount],
-            },
-            &AlkaneTransferParcel(vec![AlkaneTransfer {
-                id: pool,
-                value: lp_amount,
-            }]),
-            self.fuel(),
-        )
+        self.check_deadline(deadline)?;
+        if input_token == output_token {
+            return Err(anyhow!("input_token == output_token"));
+        }
+        let r = self.execute_zap_to_lp(
+            pool, input_token, output_token, amount_in, min_lp_tokens,
+        )?;
+        let lp = vec![AlkaneTransfer { id: r.pool, value: r.lp_received }];
+        Ok(Self::package_zap_response(r, lp, &[]))
     }
 
-    /// Forwards `lp_amount` LP into `bonding` opcode 1
-    /// (`Bond { lp_to_bond, min_fire_out }`). Used by opcodes 5
-    /// (ZapInAndBond) and 8 (Bond).
-    fn call_bonding(
+    // ── ZapInForExactLp (opcode 2) ───────────────────────────────────
+
+    fn zap_in_for_exact_lp(
         &self,
-        bonding: AlkaneId,
         pool: AlkaneId,
-        lp_amount: u128,
-        min_fire_out: u128,
+        input_token: AlkaneId,
+        output_token: AlkaneId,
+        lp_out: u128,
+        amount_in_max: u128,
+        deadline: u128,
     ) -> Result<CallResponse> {
-        self.call(
-            &Cellpack {
-                target: bonding,
-                inputs: vec![1, lp_amount, min_fire_out],
-            },
-            &AlkaneTransferParcel(vec![AlkaneTransfer {
-                id: pool,
-                value: lp_amount,
-            }]),
-            self.fuel(),
-        )
+        self.check_deadline(deadline)?;
+        if input_token == output_token {
+            return Err(anyhow!("input_token == output_token"));
+        }
+        let (amount_in, state) = self.derive_exact_lp_input(
+            pool, input_token, output_token, lp_out, amount_in_max,
+        )?;
+        // Reuse the already-read pool state (immutable until the swap
+        // fires) instead of reading it a second time.
+        let r = self.execute_zap_to_lp_with_state(
+            pool, input_token, output_token, amount_in, lp_out, &state,
+        )?;
+        let lp = vec![AlkaneTransfer { id: r.pool, value: r.lp_received }];
+        Ok(Self::package_zap_response(r, lp, &[]))
     }
 
     // ── ZapIn + Stake (opcode 4) ─────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)] // signature fixed by the opcode ABI
     fn zap_in_and_stake(
         &self,
         pool: AlkaneId,
@@ -905,40 +865,100 @@ impl Zap {
         let r = self.execute_zap_to_lp(
             pool, input_token, output_token, amount_in, min_lp_tokens,
         )?;
-
         let stake_resp = self.call_staking(
             staking, r.pool, r.lp_received, lock_duration,
         )?;
-
-        // Build response: position NFT (from staking) + residuals + leftovers
-        let mut response = CallResponse::default();
-        for tr in &stake_resp.alkanes.0 {
-            response.alkanes.0.push(tr.clone());
-        }
-        if r.residual_input > 0 {
-            response.alkanes.0.push(AlkaneTransfer {
-                id: r.input_token,
-                value: r.residual_input,
-            });
-        }
-        if r.residual_output > 0 {
-            response.alkanes.0.push(AlkaneTransfer {
-                id: r.output_token,
-                value: r.residual_output,
-            });
-        }
-        for tr in r.leftovers {
-            response.alkanes.0.push(tr);
-        }
-        response.alkanes.0 = aggregate_transfers(response.alkanes.0);
-
-        let mut data = Vec::with_capacity(16);
-        data.extend_from_slice(&r.lp_received.to_le_bytes());
-        response.data = data;
-        Ok(response)
+        Ok(Self::package_zap_response(r, stake_resp.alkanes.0, &stake_resp.data))
     }
 
     // ── ZapIn + Bond (opcode 5) ──────────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)] // signature fixed by the opcode ABI
+    fn zap_in_and_bond(
+        &self,
+        pool: AlkaneId,
+        input_token: AlkaneId,
+        output_token: AlkaneId,
+        amount_in: u128,
+        min_lp_tokens: u128,
+        bonding: AlkaneId,
+        min_fire_out: u128,
+        deadline: u128,
+    ) -> Result<CallResponse> {
+        self.check_deadline(deadline)?;
+        if input_token == output_token {
+            return Err(anyhow!("input_token == output_token"));
+        }
+        let r = self.execute_zap_to_lp(
+            pool, input_token, output_token, amount_in, min_lp_tokens,
+        )?;
+        let bond_resp = self.call_bonding(
+            bonding, r.pool, r.lp_received, min_fire_out,
+        )?;
+        Ok(Self::package_zap_response(r, bond_resp.alkanes.0, &bond_resp.data))
+    }
+
+    // ── ZapIn + Stake for exact LP (opcode 9) ────────────────────────
+
+    #[allow(clippy::too_many_arguments)] // signature fixed by the opcode ABI
+    fn zap_in_and_stake_for_exact_lp(
+        &self,
+        pool: AlkaneId,
+        input_token: AlkaneId,
+        output_token: AlkaneId,
+        lp_out: u128,
+        amount_in_max: u128,
+        staking: AlkaneId,
+        lock_duration: u128,
+        deadline: u128,
+    ) -> Result<CallResponse> {
+        self.check_deadline(deadline)?;
+        if input_token == output_token {
+            return Err(anyhow!("input_token == output_token"));
+        }
+        validate_lock_duration(lock_duration)?;
+
+        let (amount_in, state) = self.derive_exact_lp_input(
+            pool, input_token, output_token, lp_out, amount_in_max,
+        )?;
+        let r = self.execute_zap_to_lp_with_state(
+            pool, input_token, output_token, amount_in, lp_out, &state,
+        )?;
+        let stake_resp = self.call_staking(
+            staking, r.pool, r.lp_received, lock_duration,
+        )?;
+        Ok(Self::package_zap_response(r, stake_resp.alkanes.0, &stake_resp.data))
+    }
+
+    // ── ZapIn + Bond for exact LP (opcode 10) ────────────────────────
+
+    #[allow(clippy::too_many_arguments)] // signature fixed by the opcode ABI
+    fn zap_in_and_bond_for_exact_lp(
+        &self,
+        pool: AlkaneId,
+        input_token: AlkaneId,
+        output_token: AlkaneId,
+        lp_out: u128,
+        amount_in_max: u128,
+        bonding: AlkaneId,
+        min_fire_out: u128,
+        deadline: u128,
+    ) -> Result<CallResponse> {
+        self.check_deadline(deadline)?;
+        if input_token == output_token {
+            return Err(anyhow!("input_token == output_token"));
+        }
+        let (amount_in, state) = self.derive_exact_lp_input(
+            pool, input_token, output_token, lp_out, amount_in_max,
+        )?;
+        let r = self.execute_zap_to_lp_with_state(
+            pool, input_token, output_token, amount_in, lp_out, &state,
+        )?;
+        let bond_resp = self.call_bonding(
+            bonding, r.pool, r.lp_received, min_fire_out,
+        )?;
+        Ok(Self::package_zap_response(r, bond_resp.alkanes.0, &bond_resp.data))
+    }
 
     // ── Standalone Stake (opcode 7) ──────────────────────────────────
 
@@ -959,20 +979,15 @@ impl Zap {
         let (lp_amount, leftovers) = self.extract_input(pool, liquidity)?;
         let stake_resp = self.call_staking(staking, pool, lp_amount, lock_duration)?;
 
-        // Build response: NFT (from staking) + leftovers
-        let mut response = CallResponse::default();
-        for tr in &stake_resp.alkanes.0 {
-            response.alkanes.0.push(tr.clone());
-        }
-        for tr in leftovers {
-            response.alkanes.0.push(tr);
-        }
-        response.alkanes.0 = aggregate_transfers(response.alkanes.0);
-
-        let mut data = Vec::with_capacity(16);
+        // Response: NFT (from staking) + leftovers; data = staked LP
+        // amount followed by the staking contract's own response data.
+        let mut transfers = stake_resp.alkanes.0;
+        transfers.extend(leftovers);
+        let mut data = Vec::with_capacity(16 + stake_resp.data.len());
         data.extend_from_slice(&lp_amount.to_le_bytes());
-        response.data = data;
-        Ok(response)
+        data.extend_from_slice(&stake_resp.data);
+
+        Ok(make_response(transfers, data))
     }
 
     // ── Standalone Bond (opcode 8) ───────────────────────────────────
@@ -993,241 +1008,18 @@ impl Zap {
         let (lp_amount, leftovers) = self.extract_input(pool, liquidity)?;
         let bond_resp = self.call_bonding(bonding, pool, lp_amount, min_fire_out)?;
 
-        // Build response: bond-NFT + immediate FIRE (if any) + leftovers
-        let mut response = CallResponse::default();
-        for tr in &bond_resp.alkanes.0 {
-            response.alkanes.0.push(tr.clone());
-        }
-        for tr in leftovers {
-            response.alkanes.0.push(tr);
-        }
-        response.alkanes.0 = aggregate_transfers(response.alkanes.0);
-
-        let mut data = Vec::with_capacity(16);
+        // Response: bond-NFT + immediate FIRE (if any) + leftovers;
+        // data = bonded LP amount followed by the bonding response data.
+        let mut transfers = bond_resp.alkanes.0;
+        transfers.extend(leftovers);
+        let mut data = Vec::with_capacity(16 + bond_resp.data.len());
         data.extend_from_slice(&lp_amount.to_le_bytes());
-        response.data = data;
-        Ok(response)
+        data.extend_from_slice(&bond_resp.data);
+
+        Ok(make_response(transfers, data))
     }
 
-    fn zap_in_and_bond(
-        &self,
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        amount_in: u128,
-        min_lp_tokens: u128,
-        bonding: AlkaneId,
-        min_fire_out: u128,
-        deadline: u128,
-    ) -> Result<CallResponse> {
-        self.check_deadline(deadline)?;
-        if input_token == output_token {
-            return Err(anyhow!("input_token == output_token"));
-        }
-        let r = self.execute_zap_to_lp(
-            pool, input_token, output_token, amount_in, min_lp_tokens,
-        )?;
-
-        let bond_resp = self.call_bonding(
-            bonding, r.pool, r.lp_received, min_fire_out,
-        )?;
-
-        // Build response: bond-NFT + immediate FIRE (if any) + residuals + leftovers
-        let mut response = CallResponse::default();
-        for tr in &bond_resp.alkanes.0 {
-            response.alkanes.0.push(tr.clone());
-        }
-        if r.residual_input > 0 {
-            response.alkanes.0.push(AlkaneTransfer {
-                id: r.input_token,
-                value: r.residual_input,
-            });
-        }
-        if r.residual_output > 0 {
-            response.alkanes.0.push(AlkaneTransfer {
-                id: r.output_token,
-                value: r.residual_output,
-            });
-        }
-        for tr in r.leftovers {
-            response.alkanes.0.push(tr);
-        }
-        response.alkanes.0 = aggregate_transfers(response.alkanes.0);
-
-        let mut data = Vec::with_capacity(16);
-        data.extend_from_slice(&r.lp_received.to_le_bytes());
-        response.data = data;
-        Ok(response)
-    }
-
-    // ── ZapIn + Stake for exact LP (opcode 9) ────────────────────────
-
-    fn zap_in_and_stake_for_exact_lp(
-        &self,
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        lp_out: u128,
-        amount_in_max: u128,
-        staking: AlkaneId,
-        lock_duration: u128,
-        deadline: u128,
-    ) -> Result<CallResponse> {
-        self.check_deadline(deadline)?;
-        if input_token == output_token {
-            return Err(anyhow!("input_token == output_token"));
-        }
-        validate_lock_duration(lock_duration)?;
-        if lp_out == 0 {
-            return Err(anyhow!("lp_out must be > 0"));
-        }
-        if amount_in_max == 0 {
-            return Err(anyhow!("amount_in_max must be > 0"));
-        }
-
-        let (token_0, _token_1) = sort_alkanes(input_token, output_token);
-        let input_is_0 = input_token == token_0;
-
-        let (reserve_0, reserve_1) = self.query_reserves(pool)?;
-        if reserve_0 == 0 || reserve_1 == 0 {
-            return Err(anyhow!("pool not seeded — single-side zap impossible"));
-        }
-        let fee = self.query_fee_per_1000(pool);
-        let total_supply = self.query_total_supply(pool)?;
-        if total_supply == 0 {
-            return Err(anyhow!("pool total_supply is zero"));
-        }
-
-        let r_in = if input_is_0 { reserve_0 } else { reserve_1 };
-        let (amount_in, _) = amm_logic::calculate_amount_in_for_exact_lp(
-            lp_out, r_in, total_supply, fee,
-        )?;
-        if amount_in > amount_in_max {
-            return Err(anyhow!(
-                "required amount_in {} > amount_in_max {}",
-                amount_in, amount_in_max
-            ));
-        }
-
-        let r = self.execute_zap_to_lp_with_state(
-            pool, input_token, output_token, amount_in, lp_out,
-            reserve_0, reserve_1, fee,
-        )?;
-
-        let stake_resp = self.call_staking(
-            staking, r.pool, r.lp_received, lock_duration,
-        )?;
-
-        let mut response = CallResponse::default();
-        for tr in &stake_resp.alkanes.0 {
-            response.alkanes.0.push(tr.clone());
-        }
-        if r.residual_input > 0 {
-            response.alkanes.0.push(AlkaneTransfer {
-                id: r.input_token,
-                value: r.residual_input,
-            });
-        }
-        if r.residual_output > 0 {
-            response.alkanes.0.push(AlkaneTransfer {
-                id: r.output_token,
-                value: r.residual_output,
-            });
-        }
-        for tr in r.leftovers {
-            response.alkanes.0.push(tr);
-        }
-        response.alkanes.0 = aggregate_transfers(response.alkanes.0);
-
-        let mut data = Vec::with_capacity(16);
-        data.extend_from_slice(&r.lp_received.to_le_bytes());
-        response.data = data;
-        Ok(response)
-    }
-
-    // ── ZapIn + Bond for exact LP (opcode 10) ────────────────────────
-
-    fn zap_in_and_bond_for_exact_lp(
-        &self,
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        lp_out: u128,
-        amount_in_max: u128,
-        bonding: AlkaneId,
-        min_fire_out: u128,
-        deadline: u128,
-    ) -> Result<CallResponse> {
-        self.check_deadline(deadline)?;
-        if input_token == output_token {
-            return Err(anyhow!("input_token == output_token"));
-        }
-        if lp_out == 0 {
-            return Err(anyhow!("lp_out must be > 0"));
-        }
-        if amount_in_max == 0 {
-            return Err(anyhow!("amount_in_max must be > 0"));
-        }
-
-        let (token_0, _token_1) = sort_alkanes(input_token, output_token);
-        let input_is_0 = input_token == token_0;
-
-        let (reserve_0, reserve_1) = self.query_reserves(pool)?;
-        if reserve_0 == 0 || reserve_1 == 0 {
-            return Err(anyhow!("pool not seeded — single-side zap impossible"));
-        }
-        let fee = self.query_fee_per_1000(pool);
-        let total_supply = self.query_total_supply(pool)?;
-        if total_supply == 0 {
-            return Err(anyhow!("pool total_supply is zero"));
-        }
-
-        let r_in = if input_is_0 { reserve_0 } else { reserve_1 };
-        let (amount_in, _) = amm_logic::calculate_amount_in_for_exact_lp(
-            lp_out, r_in, total_supply, fee,
-        )?;
-        if amount_in > amount_in_max {
-            return Err(anyhow!(
-                "required amount_in {} > amount_in_max {}",
-                amount_in, amount_in_max
-            ));
-        }
-
-        let r = self.execute_zap_to_lp_with_state(
-            pool, input_token, output_token, amount_in, lp_out,
-            reserve_0, reserve_1, fee,
-        )?;
-
-        let bond_resp = self.call_bonding(
-            bonding, r.pool, r.lp_received, min_fire_out,
-        )?;
-
-        let mut response = CallResponse::default();
-        for tr in &bond_resp.alkanes.0 {
-            response.alkanes.0.push(tr.clone());
-        }
-        if r.residual_input > 0 {
-            response.alkanes.0.push(AlkaneTransfer {
-                id: r.input_token,
-                value: r.residual_input,
-            });
-        }
-        if r.residual_output > 0 {
-            response.alkanes.0.push(AlkaneTransfer {
-                id: r.output_token,
-                value: r.residual_output,
-            });
-        }
-        for tr in r.leftovers {
-            response.alkanes.0.push(tr);
-        }
-        response.alkanes.0 = aggregate_transfers(response.alkanes.0);
-
-        let mut data = Vec::with_capacity(16);
-        data.extend_from_slice(&r.lp_received.to_le_bytes());
-        response.data = data;
-        Ok(response)
-    }
+    // ── ZapOut (opcode 3) ────────────────────────────────────────────
 
     fn zap_out(
         &self,
@@ -1243,49 +1035,42 @@ impl Zap {
         }
 
         // Read pool state once; pass to hot-path helper.
-        let (token_a, token_b, reserve_a, reserve_b, _ts) =
-            self.query_pool_details_full(pool)?;
-        if output_token != token_a && output_token != token_b {
+        let state = self.read_pool_state(pool)?;
+        if output_token != state.token_a && output_token != state.token_b {
             return Err(anyhow!(
                 "output_token {:?} is not in pool ({:?}, {:?})",
-                output_token, token_a, token_b
+                output_token, state.token_a, state.token_b
             ));
         }
-        let fee = self.query_fee_per_1000(pool);
-
-        self.execute_zap_out_with_state(
-            pool, output_token, liquidity, min_out,
-            token_a, token_b, reserve_a, reserve_b, fee,
-        )
+        self.execute_zap_out_with_state(pool, output_token, liquidity, min_out, &state)
     }
 
     /// "Hot path" ZapOut without duplicate pool reads — used when the
-    /// caller (e.g. `zap_out_for_exact_out`) has already read tokens,
-    /// reserves, and fee for its own math.
+    /// caller (e.g. `zap_out_for_exact_out`) has already read the pool
+    /// state for its own math. Unexpected transfers from the pool are
+    /// swept into the refund instead of being dropped.
     fn execute_zap_out_with_state(
         &self,
         pool: AlkaneId,
         output_token: AlkaneId,
         liquidity: u128,
         min_out: u128,
-        token_a: AlkaneId,
-        token_b: AlkaneId,
-        reserve_a: u128,
-        reserve_b: u128,
-        fee: u128,
+        state: &PoolState,
     ) -> Result<CallResponse> {
         // Extract LP. Pool IS its own LP token (alkane_id same).
-        let (lp_amount, leftovers) = self.extract_input(pool, liquidity)?;
+        let (lp_amount, mut leftovers) = self.extract_input(pool, liquidity)?;
 
         // Step 1: WithdrawAndBurn → (amt_a, amt_b) proportional
         let withdraw_resp = self.call_withdraw_and_burn(pool, lp_amount)?;
         let mut amt_a = 0u128;
         let mut amt_b = 0u128;
         for tr in &withdraw_resp.alkanes.0 {
-            if tr.id == token_a {
+            if tr.id == state.token_a {
                 amt_a = amt_a.saturating_add(tr.value);
-            } else if tr.id == token_b {
+            } else if tr.id == state.token_b {
                 amt_b = amt_b.saturating_add(tr.value);
+            } else {
+                leftovers.push(*tr); // unexpected — back to caller
             }
         }
         if amt_a == 0 || amt_b == 0 {
@@ -1294,19 +1079,20 @@ impl Zap {
 
         // Step 2: swap "other" side fully → output_token.
         // Pool reserves AFTER withdraw.
-        let new_r_a = reserve_a.saturating_sub(amt_a);
-        let new_r_b = reserve_b.saturating_sub(amt_b);
+        let new_r_a = state.reserve_a.saturating_sub(amt_a);
+        let new_r_b = state.reserve_b.saturating_sub(amt_b);
 
         let (input_token, input_amt, own_side, r_in, r_out, output_is_a) =
-            if output_token == token_a {
-                (token_b, amt_b, amt_a, new_r_b, new_r_a, true)
+            if output_token == state.token_a {
+                (state.token_b, amt_b, amt_a, new_r_b, new_r_a, true)
             } else {
-                (token_a, amt_a, amt_b, new_r_a, new_r_b, false)
+                (state.token_a, amt_a, amt_b, new_r_a, new_r_b, false)
             };
 
         let swap_received = if input_amt > 0 && r_in > 0 && r_out > 0 {
-            let expected_out =
-                amm_logic::calculate_swap_out(input_amt, r_in, r_out, fee)?;
+            let expected_out = amm_logic::calculate_swap_out(
+                input_amt, r_in, r_out, state.fee_per_1000,
+            )?;
             // amount_0_out is token_a side, amount_1_out is token_b side.
             let (amt_0_out, amt_1_out) = if output_is_a {
                 (expected_out, 0u128)
@@ -1320,6 +1106,8 @@ impl Zap {
             for tr in &swap_resp.alkanes.0 {
                 if tr.id == output_token {
                     got = got.saturating_add(tr.value);
+                } else {
+                    leftovers.push(*tr); // unexpected refund — back to caller
                 }
             }
             got
@@ -1335,50 +1123,16 @@ impl Zap {
             ));
         }
 
-        let mut response = CallResponse::default();
-        response.alkanes.0.push(AlkaneTransfer {
+        let mut transfers = vec![AlkaneTransfer {
             id: output_token,
             value: total_out,
-        });
-        for tr in leftovers {
-            response.alkanes.0.push(tr);
-        }
-
-        response.alkanes.0 = aggregate_transfers(response.alkanes.0);
+        }];
+        transfers.extend(leftovers);
 
         let mut data = Vec::with_capacity(16);
         data.extend_from_slice(&total_out.to_le_bytes());
-        response.data = data;
-        Ok(response)
-    }
 
-    /// Read `(token_a, token_b, reserve_a, reserve_b, total_supply)`
-    /// from pool's PoolDetails (opcode 999). Used only by `ZapOut` and
-    /// `ZapInForExactLp`.
-    fn query_pool_details_full(
-        &self,
-        pool: AlkaneId,
-    ) -> Result<(AlkaneId, AlkaneId, u128, u128, u128)> {
-        let resp = self.staticcall(
-            &Cellpack { target: pool, inputs: vec![999] },
-            &AlkaneTransferParcel::default(),
-            self.fuel(),
-        )?;
-        if resp.data.len() < 112 {
-            return Err(anyhow!("PoolDetails too short: {}", resp.data.len()));
-        }
-        let token_a = AlkaneId {
-            block: u128::from_le_bytes(resp.data[0..16].try_into().unwrap()),
-            tx: u128::from_le_bytes(resp.data[16..32].try_into().unwrap()),
-        };
-        let token_b = AlkaneId {
-            block: u128::from_le_bytes(resp.data[32..48].try_into().unwrap()),
-            tx: u128::from_le_bytes(resp.data[48..64].try_into().unwrap()),
-        };
-        let reserve_a = u128::from_le_bytes(resp.data[64..80].try_into().unwrap());
-        let reserve_b = u128::from_le_bytes(resp.data[80..96].try_into().unwrap());
-        let total_supply = u128::from_le_bytes(resp.data[96..112].try_into().unwrap());
-        Ok((token_a, token_b, reserve_a, reserve_b, total_supply))
+        Ok(make_response(transfers, data))
     }
 
     // ── ZapOutForExactOut (opcode 6) ─────────────────────────────────
@@ -1400,28 +1154,30 @@ impl Zap {
         }
 
         // Read pool state once (used for both inverse formula AND zap_out execution).
-        let (token_a, token_b, reserve_a, reserve_b, total_supply) =
-            self.query_pool_details_full(pool)?;
-        if output_token != token_a && output_token != token_b {
+        let state = self.read_pool_state(pool)?;
+        if output_token != state.token_a && output_token != state.token_b {
             return Err(anyhow!(
                 "output_token {:?} is not in pool ({:?}, {:?})",
-                output_token, token_a, token_b
+                output_token, state.token_a, state.token_b
             ));
         }
-        let fee = self.query_fee_per_1000(pool);
-        if total_supply == 0 {
+        if state.total_supply == 0 {
             return Err(anyhow!("pool total_supply is zero"));
         }
 
         // Reserve of the OUTPUT side (the one we want back).
-        let r_a = if output_token == token_a { reserve_a } else { reserve_b };
+        let r_a = if output_token == state.token_a {
+            state.reserve_a
+        } else {
+            state.reserve_b
+        };
 
         // Inverse formula → minimum L for desired output_amount.
         let required_lp = amm_logic::calculate_lp_for_exact_out(
             output_amount,
             r_a,
-            total_supply,
-            fee,
+            state.total_supply,
+            state.fee_per_1000,
         )?;
 
         if required_lp > max_lp {
@@ -1435,10 +1191,11 @@ impl Zap {
         // Pass already-read state to the hot path. min_out = output_amount —
         // catches the edge case where rounding produced < target.
         self.execute_zap_out_with_state(
-            pool, output_token, required_lp, output_amount,
-            token_a, token_b, reserve_a, reserve_b, fee,
+            pool, output_token, required_lp, output_amount, &state,
         )
     }
+
+    // ── Views / misc ─────────────────────────────────────────────────
 
     fn forward(&self) -> Result<CallResponse> {
         let context = self.context()?;
@@ -1446,17 +1203,18 @@ impl Zap {
     }
 
     fn get_name(&self) -> Result<CallResponse> {
-        let mut response = CallResponse::default();
-        response.data = b"Zippo".to_vec();
-        Ok(response)
+        Ok(CallResponse {
+            data: b"Zippo".to_vec(),
+            ..Default::default()
+        })
     }
 
     fn made_in(&self) -> Result<CallResponse> {
-        let mut response = CallResponse::default();
-        response.data = b"Winnipeg".to_vec();
-        Ok(response)
+        Ok(CallResponse {
+            data: b"Winnipeg".to_vec(),
+            ..Default::default()
+        })
     }
-
 }
 
 declare_alkane! {

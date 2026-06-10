@@ -24,6 +24,14 @@ or bonding — all atomically in a single transaction.
 | 99 | `GetName` | view → returns `"Zippo"` |
 | 100 | `MadeIn` | view → returns `"Winnipeg"` |
 
+Every mutating opcode takes a `deadline` (block height): `0` disables
+the check, any other value reverts the call once `height > deadline`.
+
+The exact-LP variants (2, 9, 10) mint **at least** `lp_out` — ceil
+rounding can mint a hair more, and the surplus is returned (op 2) or
+forwarded along with the target amount (ops 9, 10) so no LP dust is
+orphaned.
+
 ## Math
 
 ### Forward zap (op 1)
@@ -66,7 +74,7 @@ Smaller root plus a safety margin (+3 wei) to absorb integer-rounding in
 
 ## Lock duration whitelist
 
-Opcodes 4 and 7 accept only exact values from `fire-constants`:
+Opcodes 4, 7, and 9 accept only exact values from `fire-constants`:
 
 | `lock_duration` | Period | Multiplier |
 |---:|---|---:|
@@ -89,32 +97,56 @@ work is done.
 * **Atomic revert** — any `Err` returned from a handler reverts the entire
   protostone: incoming alkanes are refunded via the `:v0:v0` pointer, and
   pool state is untouched.
-* **No duplicate pool reads** — `execute_zap_to_lp_with_state` and
-  `execute_zap_out_with_state` accept pre-read state from their caller
-  (see `ZapInForExactLp` / `ZapOutForExactOut`), saving ~175K fuel.
+* **No stranded transfers** — anything the pool returns beyond the
+  expected swap output / LP (e.g. deposit change) is swept into the
+  caller's refund. A dropped transfer would strand tokens forever in a
+  stateless contract.
+* **Pair validation up front** — the caller's `(input_token,
+  output_token)` must match the pool's pair exactly; a mismatch reverts
+  before any tokens move instead of surfacing as an opaque pool error
+  mid-zap.
+* **Fee read is load-bearing** — a failed `GetTotalFee` is a hard error,
+  never a silent default. Assuming a wrong fee would either donate the
+  difference to the pool (real fee lower) or revert opaquely (higher).
+* **Overflow-safe math** — discriminants and `L·1000·R`-scale products
+  are computed in U512; `ruint` wraps silently on overflow in release
+  builds, so the old U256 intermediates produced garbage splits for
+  reserves above ~2^117. Regression-tested across the full u128 domain.
+* **No duplicate pool reads** — each opcode reads the pool snapshot
+  (PoolDetails 999 + GetTotalFee 20) exactly once; the
+  `_with_state` hot paths reuse it for both the inverse formula and
+  execution (see `ZapInForExactLp` / `ZapOutForExactOut`), saving ~175K
+  fuel.
 
-## Fuel cost (measured on regtest)
+## Fuel cost
 
-| Op | Total | Cross-contract calls |
-|---|---:|---:|
-| 1 ZapIn | 1,355,488 | 4 (reserves + fee + swap + add_liq) |
-| 2 ZapInForExactLp | ~1,520,000 | 5 (+ PoolDetails) |
-| 3 ZapOut | ~1,400,000 | 4 (PoolDetails + fee + withdraw + swap) |
-| 6 ZapOutForExactOut | ~1,450,000 | 4 |
-| 4 ZapInAndStake | ~1,950,000 | 5 (+ staking hop) |
-| 5 ZapInAndBond | ~1,950,000 | 5 (+ bonding hop) |
+| Op | Cross-contract calls |
+|---|---:|
+| 1 ZapIn | 4 (PoolDetails + fee + swap + add_liq) |
+| 2 ZapInForExactLp | 4 (PoolDetails + fee + swap + add_liq) |
+| 3 ZapOut | 4 (PoolDetails + fee + withdraw + swap) |
+| 6 ZapOutForExactOut | 4 |
+| 4 ZapInAndStake | 5 (+ staking hop) |
+| 5 ZapInAndBond | 5 (+ bonding hop) |
+| 9 / 10 exact-LP + stake/bond | 5 |
 
 Cross-contract calls account for ~80-90% of total fuel. Pure math is
-under 10%.
+under 10%. Earlier regtest measurements (op 1: 1,355,488; op 2:
+~1,520,000) predate the PoolDetails consolidation — ops 2/9/10 have
+since dropped one staticcall (~87K fuel) and op 1 swapped
+GetReserves(97) for PoolDetails(999); re-measure before quoting
+numbers.
 
 ## Build
 
 ```bash
-CC="/opt/homebrew/opt/llvm/bin/clang" \
+# CC must be a wasm32-capable clang (homebrew llvm); the prefix is
+# /opt/homebrew on Apple-silicon and /usr/local on Intel Macs.
+CC="$(brew --prefix llvm)/bin/clang" \
     cargo build --release --target wasm32-unknown-unknown
 ```
 
-WASM artifact: `target/wasm32-unknown-unknown/release/zippo.wasm` (~234K).
+WASM artifact: `target/wasm32-unknown-unknown/release/zippo.wasm` (~241K).
 
 ## Tests
 
@@ -129,7 +161,8 @@ CC="/opt/homebrew/opt/llvm/bin/clang" \
 ```
 
 Coverage:
-* **29 unit tests** for the math (forward/inverse round-trip, edge cases)
+* **35 unit tests** for the math (forward/inverse round-trip, edge
+  cases, U512 overflow regressions at u128-scale reserves)
 * **24 integration tests** via fire's `wasm-bindgen-test` harness
 * **5 real regtest e2e** (via `alkanes-cli` + bitcoind + metashrew)
 
@@ -137,7 +170,7 @@ Coverage:
 
 * [`alkanes-runtime`](https://github.com/kungfuflex/alkanes-rs) — runtime / messaging
 * [`alkanes-support`](https://github.com/kungfuflex/alkanes-rs) — types
-* [`oyl-amm`](https://github.com/kungfuflex/alkanes-rs) (target pool) — opcodes 1, 2, 3, 20, 97, 999
+* [`oyl-amm`](https://github.com/kungfuflex/alkanes-rs) (target pool) — opcodes 1, 2, 3, 20, 999
 * [`fire-staking`](../../alkanes/fire-staking/) (target stake) — opcode 1
 * [`fire-bonding`](../../alkanes/fire-bonding/) (target bond) — opcode 1
 
