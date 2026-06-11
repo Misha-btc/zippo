@@ -120,22 +120,33 @@ work is done.
 
 ## Fuel cost
 
-| Op | Cross-contract calls |
-|---|---:|
-| 1 ZapIn | 4 (PoolDetails + fee + swap + add_liq) |
-| 2 ZapInForExactLp | 4 (PoolDetails + fee + swap + add_liq) |
-| 3 ZapOut | 4 (PoolDetails + fee + withdraw + swap) |
-| 6 ZapOutForExactOut | 4 |
-| 4 ZapInAndStake | 5 (+ staking hop) |
-| 5 ZapInAndBond | 5 (+ bonding hop) |
-| 9 / 10 exact-LP + stake/bond | 5 |
+Measured against the 3,500,000-fuel regtest budget under current
+mainnet fuel rules (post-V217 accounting + CHANGE1 tariffs), via
+`view::simulate_parcel` in the in-process harness and cross-checked on
+live regtest (`metashrew_view simulate`, within +2-3%):
+
+| Op | Cross-contract calls | Fuel (harness) | Fuel (regtest) | Budget |
+|---|---:|---:|---:|---:|
+| 1 ZapIn | 4 (PoolDetails + fee + swap + add_liq) | 2,189,152 | 2,253,125 | 64% |
+| 2 ZapInForExactLp | 4 (PoolDetails + fee + swap + add_liq) | 2,211,284 | 2,258,223 | 65% |
+| 3 ZapOut | 4 (PoolDetails + fee + withdraw + swap) | 1,970,479 | 2,022,556 | 58% |
+| 6 ZapOutForExactOut | 4 | 2,146,572 | 2,190,162 | 63% |
+| 4 ZapInAndStake | 5 (+ staking hop) | 2,350,309 * | — | 67% * |
+| 5 ZapInAndBond | 5 (+ bonding hop) | 2,350,309 * | — | 67% * |
+| 7 Stake standalone | 2 | 220,792 * | — | 6% * |
+| 8 Bond standalone | 2 | 220,792 * | — | 6% * |
+
+\* ops 4/5/7/8 measured against a mock proto-token stake/bond target; a
+real FIRE staking hop (position-NFT CREATECHILD + beacon delegatecall)
+costs more — re-measure against the full FIRE stack before treating the
+~1.15M headroom as final.
 
 Cross-contract calls account for ~80-90% of total fuel. Pure math is
-under 10%. Earlier regtest measurements (op 1: 1,355,488; op 2:
-~1,520,000) predate the PoolDetails consolidation — ops 2/9/10 have
-since dropped one staticcall (~87K fuel) and op 1 swapped
-GetReserves(97) for PoolDetails(999); re-measure before quoting
-numbers.
+under 10%. Earlier figures (op 1: 1,355,488; op 2: ~1,520,000) were
+measured under pre-V217 fuel accounting, which silently skipped
+host-side charges (extcall/storage/load) — the jump reflects the
+accounting fix and CHANGE1 tariffs, not code regressions (the
+PoolDetails consolidation itself costs only ~110K).
 
 ## Build
 
@@ -163,7 +174,7 @@ CC="/opt/homebrew/opt/llvm/bin/clang" \
 Coverage:
 * **35 unit tests** for the math (forward/inverse round-trip, edge
   cases, U512 overflow regressions at u128-scale reserves)
-* **24 integration tests** via fire's `wasm-bindgen-test` harness
+* **33 integration tests** via fire's `wasm-bindgen-test` harness
 * **5 real regtest e2e** (via `alkanes-cli` + bitcoind + metashrew)
 
 ## Dependencies
