@@ -3,11 +3,18 @@
 //! Fee model: `fee_per_1000` (e.g. `10` → 1%). The full input is added
 //! to the reserve; the fee is retained inside the K invariant
 //! (Uniswap V2-style).
+//!
+//! All intermediate products that can exceed 256 bits for u128-scale
+//! inputs (discriminants, `L·1000·R` style terms) are computed in U512.
+//! `ruint` arithmetic wraps silently on overflow in release builds, so
+//! staying inside the type's range is a correctness requirement, not a
+//! style choice.
 
 use anyhow::{anyhow, Result};
 use ruint::Uint;
 
 pub type U256 = Uint<256, 4>;
+pub type U512 = Uint<512, 8>;
 
 /// Constant-product output with `fee_per_1000`.
 ///
@@ -25,14 +32,18 @@ pub fn calculate_swap_out(
     if reserve_in == 0 || reserve_out == 0 {
         return Err(anyhow!("pool has no liquidity on one side"));
     }
-    let a = U256::from(1000u128.saturating_sub(fee_per_1000));
-    let ai = U256::from(amount_in);
-    let ri = U256::from(reserve_in);
-    let ro = U256::from(reserve_out);
+    if fee_per_1000 >= 1000 {
+        return Err(anyhow!("pool fee >= 100% (misconfigured)"));
+    }
+    let a = U512::from(1000u128 - fee_per_1000);
+    let ai = U512::from(amount_in);
+    let ri = U512::from(reserve_in);
+    let ro = U512::from(reserve_out);
 
+    // numerator = ai·a·ro ≤ 2^128 · 2^10 · 2^128 = 2^266 — needs U512.
     let ai_with_fee = ai * a;
     let numerator = ai_with_fee * ro;
-    let denominator = ri * U256::from(1000u128) + ai_with_fee;
+    let denominator = ri * U512::from(1000u128) + ai_with_fee;
     if denominator.is_zero() {
         return Err(anyhow!("swap denominator is zero (degenerate pool state)"));
     }
@@ -50,6 +61,9 @@ pub fn calculate_swap_out(
 /// where `a = 1000 − fee_per_1000`.
 ///
 /// `s = (√(Rx·(Rx·(1000+a)² + 4·a·1000·A)) − Rx·(1000+a)) / (2·a)`
+///
+/// The discriminant carries an `Rx²·k²` term (up to ~2^280 for
+/// u128-scale reserves), so it is computed in U512.
 pub fn calculate_single_side_swap(
     amount_in: u128,
     reserve_in: u128,
@@ -58,13 +72,13 @@ pub fn calculate_single_side_swap(
     if amount_in == 0 || reserve_in == 0 {
         return 0;
     }
-    let a = U256::from(1000u128.saturating_sub(fee_per_1000));
-    let big_a = U256::from(amount_in);
-    let rx = U256::from(reserve_in);
-    let thousand = U256::from(1000u128);
+    let a = U512::from(1000u128.saturating_sub(fee_per_1000));
+    let big_a = U512::from(amount_in);
+    let rx = U512::from(reserve_in);
+    let thousand = U512::from(1000u128);
     let k = thousand + a;
 
-    let inner = rx * k * k + U256::from(4u128) * a * thousand * big_a;
+    let inner = rx * k * k + U512::from(4u128) * a * thousand * big_a;
     let disc = rx * inner;
     let sqrt_disc = integer_sqrt(disc);
     let rx_k = rx * k;
@@ -72,7 +86,7 @@ pub fn calculate_single_side_swap(
         return 0;
     }
     let num = sqrt_disc - rx_k;
-    let den = U256::from(2u128) * a;
+    let den = U512::from(2u128) * a;
     if den.is_zero() {
         return 0;
     }
@@ -108,28 +122,28 @@ pub fn calculate_amount_in_for_exact_lp(
     if total_supply == 0 {
         return Err(anyhow!("pool total_supply is zero"));
     }
-    let a_prime = U256::from(1000u128.saturating_sub(fee_per_1000));
+    let a_prime = U512::from(1000u128.saturating_sub(fee_per_1000));
     if a_prime.is_zero() {
         return Err(anyhow!("fee >= 1000"));
     }
-    let l = U256::from(lp_out);
-    let ri = U256::from(reserve_in);
-    let ts = U256::from(total_supply);
-    let thousand = U256::from(1000u128);
-    let one = U256::from(1u128);
+    let l = U512::from(lp_out);
+    let ri = U512::from(reserve_in);
+    let ts = U512::from(total_supply);
+    let thousand = U512::from(1000u128);
+    let one = U512::from(1u128);
 
-    // s = ceil(L · 1000 · R_in / (a' · ts))
+    // s = ceil(L · 1000 · R_in / (a' · ts)) — numerator up to 2^266.
     let s_num = l * thousand * ri;
     let s_den = a_prime * ts;
     let s = (s_num + s_den - one) / s_den;
     let s_u128: u128 = s.try_into().map_err(|_| anyhow!("s overflow u128"))?;
 
-    // A_in = s + ceil(L · (R_in + s) / ts)
+    // A_in = s + ceil(L · (R_in + s) / ts) — product up to 2^257.
     let ri_plus_s = ri + s;
     let a_in_part = l * ri_plus_s;
     let a_in_part_div = (a_in_part + ts - one) / ts;
-    let a_in_u256 = s + a_in_part_div;
-    let amount_in: u128 = a_in_u256.try_into().map_err(|_| anyhow!("amount_in overflow u128"))?;
+    let a_in_u512 = s + a_in_part_div;
+    let amount_in: u128 = a_in_u512.try_into().map_err(|_| anyhow!("amount_in overflow u128"))?;
 
     Ok((amount_in, s_u128))
 }
@@ -143,6 +157,8 @@ pub fn calculate_amount_in_for_exact_lp(
 /// where `f = L / ts` and `R_a` is the output-side reserve.
 /// Smaller root: `f = (B − √(B² − 4·10⁶·R_a·T)) / (2000·R_a)`,
 /// where `B = R_a·(2000−fee) + T·fee`.
+///
+/// `B²` reaches ~2^280 for u128-scale reserves — computed in U512.
 ///
 /// L is rounded **up** so that burning this L makes the pool deliver
 /// ≥ `output_amount` (overshoot is microscopic).
@@ -177,19 +193,19 @@ pub fn calculate_lp_for_exact_out(
         return Err(anyhow!("pool fee >= 100% (misconfigured)"));
     }
 
-    let r_a = U256::from(reserve_out_side);
-    let t = U256::from(output_amount);
-    let ts = U256::from(total_supply);
-    let fee_u = U256::from(fee_per_1000);
-    let thousand = U256::from(1000u128);
-    let two_thousand = U256::from(2000u128);
-    let one = U256::from(1u128);
+    let r_a = U512::from(reserve_out_side);
+    let t = U512::from(output_amount);
+    let ts = U512::from(total_supply);
+    let fee_u = U512::from(fee_per_1000);
+    let thousand = U512::from(1000u128);
+    let two_thousand = U512::from(2000u128);
+    let one = U512::from(1u128);
 
     // B = R_a · (2000 − fee) + T · fee
     let b_pos = r_a * (two_thousand - fee_u) + t * fee_u;
 
     // disc = B² − 4·1000·R_a · 1000·T
-    let four_ac = U256::from(4u128) * thousand * r_a * thousand * t;
+    let four_ac = U512::from(4u128) * thousand * r_a * thousand * t;
     if b_pos * b_pos < four_ac {
         return Err(anyhow!("discriminant negative — output_amount unreachable"));
     }
@@ -224,6 +240,7 @@ pub fn calculate_lp_for_exact_out(
 }
 
 /// `a · b / c` via U256 — avoids overflow of intermediate u128 values.
+/// (`a·b` fits U256 exactly: `(2^128−1)² < 2^256`.)
 pub fn mul_div(a: u128, b: u128, c: u128) -> u128 {
     if c == 0 {
         return 0;
@@ -232,16 +249,26 @@ pub fn mul_div(a: u128, b: u128, c: u128) -> u128 {
     r.try_into().unwrap_or(0)
 }
 
-/// Babylonian integer sqrt over U256.
-pub fn integer_sqrt(n: U256) -> U256 {
+/// Babylonian integer sqrt, generic over Uint width.
+///
+/// The initial guess `n/2 + 1` is ≥ √n for all n ≥ 1 and never
+/// overflows (unlike `(n+1)/2`, which wraps at `Uint::MAX`).
+pub fn integer_sqrt<const BITS: usize, const LIMBS: usize>(
+    n: Uint<BITS, LIMBS>,
+) -> Uint<BITS, LIMBS> {
+    let one = Uint::<BITS, LIMBS>::from(1u8);
+    let two = Uint::<BITS, LIMBS>::from(2u8);
     if n.is_zero() {
-        return U256::ZERO;
+        return Uint::ZERO;
+    }
+    if n < Uint::from(4u8) {
+        return one; // sqrt(1..=3) == 1
     }
     let mut x = n;
-    let mut y = (x + U256::from(1u128)) / U256::from(2u128);
+    let mut y = n / two + one;
     while y < x {
         x = y;
-        y = (x + n / x) / U256::from(2u128);
+        y = (x + n / x) / two;
     }
     x
 }
@@ -271,6 +298,7 @@ mod tests {
     fn sqrt_floor_for_non_squares() {
         assert_eq!(integer_sqrt(U256::from(99u128)), U256::from(9u128));
         assert_eq!(integer_sqrt(U256::from(2u128)), U256::from(1u128));
+        assert_eq!(integer_sqrt(U256::from(3u128)), U256::from(1u128));
         assert_eq!(integer_sqrt(U256::from(10u128)), U256::from(3u128));
     }
 
@@ -279,6 +307,23 @@ mod tests {
         // sqrt(2^200) == 2^100
         let n: U256 = U256::from(1u128) << 200;
         let expected: U256 = U256::from(1u128) << 100;
+        assert_eq!(integer_sqrt(n), expected);
+    }
+
+    #[test]
+    fn sqrt_max_does_not_overflow() {
+        // The old `(n+1)/2` initial guess wrapped at Uint::MAX and
+        // ended in a division by zero. sqrt(2^256 − 1) == 2^128 − 1.
+        let n = U256::MAX;
+        let expected = U256::from(u128::MAX);
+        assert_eq!(integer_sqrt(n), expected);
+    }
+
+    #[test]
+    fn sqrt_u512_width() {
+        // sqrt over the wider type used by the zap math.
+        let n: U512 = U512::from(1u128) << 300;
+        let expected: U512 = U512::from(1u128) << 150;
         assert_eq!(integer_sqrt(n), expected);
     }
 
@@ -344,6 +389,16 @@ mod tests {
         assert!(calculate_swap_out(0, 1000, 1000, 10).is_err());
         assert!(calculate_swap_out(100, 0, 1000, 10).is_err());
         assert!(calculate_swap_out(100, 1000, 0, 10).is_err());
+        assert!(calculate_swap_out(100, 1000, 1000, 1000).is_err()); // fee >= 100%
+    }
+
+    #[test]
+    fn swap_out_huge_values() {
+        // numerator ≈ 2^264 — wrapped silently in the old U256 version.
+        let half = u128::MAX / 2;
+        let out = calculate_swap_out(half, half, half, 10).unwrap();
+        // out = in·a·R/(R·1000 + in·a) ≈ R·990/1990 ≈ 0.497·R
+        assert!(out > half / 3 && out < half / 2 + 1, "out = {}", out);
     }
 
     // ── calculate_single_side_swap ──
@@ -390,7 +445,9 @@ mod tests {
         let dust_out_as_in = mul_div(dust_out, new_r_in, new_r_out);
         let total_dust = dust_in + dust_out_as_in;
 
-        let limit = amount * max_dust_bps / 10_000;
+        // mul_div, not `amount * bps / 10_000` — the bare product
+        // overflows u128 for amounts above u128::MAX / 10_000.
+        let limit = mul_div(amount, max_dust_bps, 10_000);
         assert!(
             total_dust <= limit,
             "dust > {}bps: amount={}, r_in={}, r_out={}, fee={}, s={}, out={}, dust_in={}, dust_out={} (as in: {}), limit={}",
@@ -462,6 +519,14 @@ mod tests {
         // s must never equal amount (no remainder to deposit)
         let s = calculate_single_side_swap(100, 10_000, 10);
         assert!(s < 100);
+    }
+
+    #[test]
+    fn single_side_huge_reserves_no_wrap() {
+        // Reserves above ~2^117 wrapped the U256 discriminant in the
+        // old version (rx²·k² ≥ 2^256), producing a garbage split.
+        // U512 keeps the math exact across the full u128 domain.
+        assert_dust_below(u128::MAX / 4, u128::MAX / 2, u128::MAX / 2, 10, 100);
     }
 
     // ── calculate_amount_in_for_exact_lp ──
@@ -542,6 +607,18 @@ mod tests {
         assert!(calculate_amount_in_for_exact_lp(100, 1000, 1000, 1000).is_err()); // fee=1000 → a'=0
     }
 
+    #[test]
+    fn inverse_exact_lp_huge_values() {
+        // L·1000·R_in ≈ 2^266 — wrapped silently in the old U256 version.
+        let big = 1u128 << 126;
+        let (amount_in, s) =
+            calculate_amount_in_for_exact_lp(big, big, big, 10).unwrap();
+        assert!(s > 0 && amount_in > s);
+        // Minting 100% of supply against an equal reserve needs
+        // ~3.02·R_in input (s ≈ 1.01·R, deposit ≈ 2.01·R).
+        assert!(amount_in / big == 3, "amount_in = {}", amount_in);
+    }
+
     // ── calculate_lp_for_exact_out (ZapOut inverse) ──
 
     /// Forward/inverse round-trip for ZapOut: given LP `L`, compute T
@@ -617,12 +694,22 @@ mod tests {
     }
 
     #[test]
+    fn lp_for_exact_out_huge_values() {
+        // B² ≈ 2^270 — wrapped silently in the old U256 version.
+        let t = 1u128 << 120;
+        let r_a = 1u128 << 124;
+        let ts = 1u128 << 124;
+        let l = calculate_lp_for_exact_out(t, r_a, ts, 10).unwrap();
+        // T/R_a = 1/16 → f ≈ T/(1.99·R_a) ≈ 1/31.8 → L ≈ ts/32.
+        assert!(l > ts / 64 && l < ts / 16, "L = {}", l);
+    }
+
+    #[test]
     fn single_side_huge_values() {
-        // ~u128 / 1e6 — must not overflow thanks to U256
+        // ~u128 / 1e6 — must not overflow thanks to wide intermediates
         let amount = u128::MAX / 1_000_000;
         let r_in = u128::MAX / 2_000_000;
         let r_out = u128::MAX / 2_000_000;
         assert_dust_below(amount, r_in, r_out, 10, 100);
     }
 }
-
