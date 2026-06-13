@@ -5,10 +5,6 @@
 //!   2   ZapInForExactLp    — single-asset → exact LP target (exact-out)
 //!   3   ZapOut             — LP → single-asset (exact-in)
 //!   6   ZapOutForExactOut  — LP → exact token target (exact-out)
-//!   4   ZapInAndStake      — zap + forward LP into FIRE staking
-//!   5   ZapInAndBond       — zap + forward LP into FIRE bonding
-//!   9   ZapInAndStakeForExactLp  — exact-LP variant of ZapInAndStake
-//!   10  ZapInAndBondForExactLp   — exact-LP variant of ZapInAndBond
 //!   7   Stake              — standalone forward LP into staking
 //!   8   Bond               — standalone forward LP into bonding
 //!   50  Forward            — no-op deploy marker
@@ -71,8 +67,9 @@ pub enum ZapMessage {
     /// (opcode 14) on the oyl-amm factory. The caller specifies the
     /// desired `lp_out` and the maximum `amount_in_max` they're willing
     /// to spend. The contract derives the minimum `amount_in` via the
-    /// closed-form formula, reverts if `amount_in > amount_in_max`, and
-    /// otherwise executes the zap. The unused
+    /// forward-checked closed-form inverse (guaranteed to mint ≥
+    /// `lp_out` despite the pool's integer floors), reverts if
+    /// `amount_in > amount_in_max`, and otherwise executes the zap. The unused
     /// `amount_in_max − amount_in` is returned as change through the
     /// same leftover mechanism.
     #[opcode(2)]
@@ -82,85 +79,6 @@ pub enum ZapMessage {
         output_token: AlkaneId,
         lp_out: u128,
         amount_in_max: u128,
-        deadline: u128,
-    },
-
-    /// Zap + Stake: performs a single-side zap → LP, then forwards the
-    /// LP into a FIRE staking contract with the given `lock_duration`.
-    ///
-    /// `lock_duration` is whitelist-validated — must be exactly one of:
-    ///   `0` (no lock), `1050` (WEEK), `4375` (MONTH),
-    ///   `13125` (3 MO), `26250` (6 MO), `52500` (YEAR).
-    /// Anything else (e.g. `4374` or `52501`) reverts before any zap
-    /// work is done, so the user cannot accidentally land in an
-    /// unexpected multiplier tier.
-    ///
-    /// `staking` is the staking-clone for the current epoch (the
-    /// UI/caller resolves it via
-    /// `staking_factory.GetCurrentEpochIndex + GetEpochContract`).
-    #[opcode(4)]
-    ZapInAndStake {
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        amount_in: u128,
-        min_lp_tokens: u128,
-        staking: AlkaneId,
-        lock_duration: u128,
-        deadline: u128,
-    },
-
-    /// Zap + Bond: performs a zap → LP, then forwards the LP into a FIRE
-    /// bonding contract with `min_fire_out` (slippage guard on the bond
-    /// side). The caller receives a bond NFT (plus immediate FIRE, if
-    /// any), residuals, and leftovers.
-    #[opcode(5)]
-    ZapInAndBond {
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        amount_in: u128,
-        min_lp_tokens: u128,
-        bonding: AlkaneId,
-        min_fire_out: u128,
-        deadline: u128,
-    },
-
-    /// Exact-out variant of `ZapInAndStake`: the caller asks to stake
-    /// **at least** `lp_out` LP in the FIRE staking contract. The
-    /// contract derives the minimum `amount_in` via the closed-form
-    /// inverse formula, reverts if it would exceed `amount_in_max`,
-    /// otherwise runs the zap and forwards all minted LP (≥ `lp_out` —
-    /// ceil rounding can mint a hair more, and staking the surplus
-    /// avoids orphaning LP dust). Unused `amount_in_max − amount_in`
-    /// is refunded as change. `lock_duration` is whitelist-validated
-    /// (same set as opcode 4).
-    #[opcode(9)]
-    ZapInAndStakeForExactLp {
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        lp_out: u128,
-        amount_in_max: u128,
-        staking: AlkaneId,
-        lock_duration: u128,
-        deadline: u128,
-    },
-
-    /// Exact-out variant of `ZapInAndBond`: bond **at least** `lp_out`
-    /// LP into the FIRE bonding contract (all minted LP is forwarded,
-    /// ≥ `lp_out` by ceil rounding). Closed-form inverse derives the
-    /// minimum `amount_in`; reverts if > `amount_in_max`. Caller
-    /// receives bond NFT + immediate FIRE (if any) + residuals + change.
-    #[opcode(10)]
-    ZapInAndBondForExactLp {
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        lp_out: u128,
-        amount_in_max: u128,
-        bonding: AlkaneId,
-        min_fire_out: u128,
         deadline: u128,
     },
 
@@ -254,9 +172,7 @@ impl AlkaneResponder for Zap {}
 /// Decomposition of a zap-to-LP result: LP minted, residuals after the
 /// proportional cap, and leftovers from incoming (plus anything the
 /// pool returned that we didn't expect — swept so nothing strands in
-/// this stateless contract). Wrappers decide how to package this —
-/// `zap_in` returns LP to the caller, `zap_in_and_stake` forwards it
-/// into staking, `zap_in_and_bond` into bonding, etc.
+/// this stateless contract).
 struct ZapInResult {
     lp_received: u128,
     pool: AlkaneId,
@@ -470,8 +386,7 @@ impl Zap {
 
     /// Forwards `lp_amount` LP into `staking` opcode 1
     /// (`Stake { lock_duration, amount }`). Returns the staking response
-    /// (typically the position NFT). Used by opcodes 4 (ZapInAndStake),
-    /// 7 (Stake), and 9 (ZapInAndStakeForExactLp).
+    /// (typically the position NFT).
     fn call_staking(
         &self,
         staking: AlkaneId,
@@ -493,8 +408,7 @@ impl Zap {
     }
 
     /// Forwards `lp_amount` LP into `bonding` opcode 1
-    /// (`Bond { lp_to_bond, min_fire_out }`). Used by opcodes 5
-    /// (ZapInAndBond), 8 (Bond), and 10 (ZapInAndBondForExactLp).
+    /// (`Bond { lp_to_bond, min_fire_out }`).
     fn call_bonding(
         &self,
         bonding: AlkaneId,
@@ -574,16 +488,12 @@ impl Zap {
     }
 
     /// Package a zap-to-LP result for the caller: `transfers` carries
-    /// the op-specific payload (the LP itself for plain zaps, the
-    /// staking/bonding response for forwarding ops); residuals and
-    /// leftovers are appended, duplicates collapsed. `data` is the
-    /// minted LP amount (16 LE bytes) followed by `extra_data` (the
-    /// sub-call's response data, so bond/stake results stay visible
-    /// in traces).
+    /// the op-specific payload (the minted LP); residuals and leftovers
+    /// are appended, duplicates collapsed. `data` is the minted LP
+    /// amount (16 LE bytes).
     fn package_zap_response(
         r: ZapInResult,
         mut transfers: Vec<AlkaneTransfer>,
-        extra_data: &[u8],
     ) -> CallResponse {
         if r.residual_input > 0 {
             transfers.push(AlkaneTransfer {
@@ -599,16 +509,12 @@ impl Zap {
         }
         transfers.extend(r.leftovers);
 
-        let mut data = Vec::with_capacity(16 + extra_data.len());
-        data.extend_from_slice(&r.lp_received.to_le_bytes());
-        data.extend_from_slice(extra_data);
-
-        make_response(transfers, data)
+        make_response(transfers, r.lp_received.to_le_bytes().to_vec())
     }
 
-    /// Derive the minimum `amount_in` for an exact-LP target (shared
-    /// preamble of opcodes 2, 9, 10): read pool state, validate the
-    /// pair, run the closed-form inverse, and enforce `amount_in_max`.
+    /// Derive the minimum `amount_in` for an exact-LP target (preamble
+    /// of opcode 2): read pool state, validate the pair, run the
+    /// forward-checked closed-form inverse, and enforce `amount_in_max`.
     fn derive_exact_lp_input(
         &self,
         pool: AlkaneId,
@@ -631,9 +537,13 @@ impl Zap {
         if state.total_supply == 0 {
             return Err(anyhow!("pool total_supply is zero"));
         }
-        let r_in = if input_is_a { state.reserve_a } else { state.reserve_b };
+        let (r_in, r_out) = if input_is_a {
+            (state.reserve_a, state.reserve_b)
+        } else {
+            (state.reserve_b, state.reserve_a)
+        };
         let (amount_in, _) = amm_logic::calculate_amount_in_for_exact_lp(
-            lp_out, r_in, state.total_supply, state.fee_per_1000,
+            lp_out, r_in, r_out, state.total_supply, state.fee_per_1000,
         )?;
         if amount_in > amount_in_max {
             return Err(anyhow!(
@@ -734,18 +644,12 @@ impl Zap {
         let new_reserve_in = reserve_in.saturating_add(swap_amount);
         let new_reserve_out = reserve_out.saturating_sub(got_output);
 
-        // 3) Cap to the exact ratio — otherwise AddLiquidity would eat dust.
-        let (deposit_input, deposit_output) = {
-            let out_for_in =
-                amm_logic::mul_div(have_input, new_reserve_out, new_reserve_in);
-            if out_for_in <= have_output {
-                (have_input, out_for_in)
-            } else {
-                let in_for_out =
-                    amm_logic::mul_div(have_output, new_reserve_in, new_reserve_out);
-                (in_for_out, have_output)
-            }
-        };
+        // 3) Cap to the exact ratio — otherwise AddLiquidity would eat
+        // dust. Shared with `predict_lp_for_amount_in` so the exact-LP
+        // forward check can never diverge from execution.
+        let (deposit_input, deposit_output) = amm_logic::plan_deposit(
+            have_input, have_output, new_reserve_in, new_reserve_out,
+        );
         if deposit_input == 0 || deposit_output == 0 {
             return Err(anyhow!("computed deposit is zero on one side (amount_in too small for this pool)"));
         }
@@ -809,7 +713,7 @@ impl Zap {
             pool, input_token, output_token, amount_in, min_lp_tokens,
         )?;
         let lp = vec![AlkaneTransfer { id: r.pool, value: r.lp_received }];
-        Ok(Self::package_zap_response(r, lp, &[]))
+        Ok(Self::package_zap_response(r, lp))
     }
 
     // ── ZapInForExactLp (opcode 2) ───────────────────────────────────
@@ -836,128 +740,7 @@ impl Zap {
             pool, input_token, output_token, amount_in, lp_out, &state,
         )?;
         let lp = vec![AlkaneTransfer { id: r.pool, value: r.lp_received }];
-        Ok(Self::package_zap_response(r, lp, &[]))
-    }
-
-    // ── ZapIn + Stake (opcode 4) ─────────────────────────────────────
-
-    #[allow(clippy::too_many_arguments)] // signature fixed by the opcode ABI
-    fn zap_in_and_stake(
-        &self,
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        amount_in: u128,
-        min_lp_tokens: u128,
-        staking: AlkaneId,
-        lock_duration: u128,
-        deadline: u128,
-    ) -> Result<CallResponse> {
-        self.check_deadline(deadline)?;
-        if input_token == output_token {
-            return Err(anyhow!("input_token == output_token"));
-        }
-        // Whitelist check: lock_duration must be an exact value from
-        // FIRE constants. Revert before any zap work so we don't burn
-        // fuel on pool calls for an invalid duration.
-        validate_lock_duration(lock_duration)?;
-
-        let r = self.execute_zap_to_lp(
-            pool, input_token, output_token, amount_in, min_lp_tokens,
-        )?;
-        let stake_resp = self.call_staking(
-            staking, r.pool, r.lp_received, lock_duration,
-        )?;
-        Ok(Self::package_zap_response(r, stake_resp.alkanes.0, &stake_resp.data))
-    }
-
-    // ── ZapIn + Bond (opcode 5) ──────────────────────────────────────
-
-    #[allow(clippy::too_many_arguments)] // signature fixed by the opcode ABI
-    fn zap_in_and_bond(
-        &self,
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        amount_in: u128,
-        min_lp_tokens: u128,
-        bonding: AlkaneId,
-        min_fire_out: u128,
-        deadline: u128,
-    ) -> Result<CallResponse> {
-        self.check_deadline(deadline)?;
-        if input_token == output_token {
-            return Err(anyhow!("input_token == output_token"));
-        }
-        let r = self.execute_zap_to_lp(
-            pool, input_token, output_token, amount_in, min_lp_tokens,
-        )?;
-        let bond_resp = self.call_bonding(
-            bonding, r.pool, r.lp_received, min_fire_out,
-        )?;
-        Ok(Self::package_zap_response(r, bond_resp.alkanes.0, &bond_resp.data))
-    }
-
-    // ── ZapIn + Stake for exact LP (opcode 9) ────────────────────────
-
-    #[allow(clippy::too_many_arguments)] // signature fixed by the opcode ABI
-    fn zap_in_and_stake_for_exact_lp(
-        &self,
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        lp_out: u128,
-        amount_in_max: u128,
-        staking: AlkaneId,
-        lock_duration: u128,
-        deadline: u128,
-    ) -> Result<CallResponse> {
-        self.check_deadline(deadline)?;
-        if input_token == output_token {
-            return Err(anyhow!("input_token == output_token"));
-        }
-        validate_lock_duration(lock_duration)?;
-
-        let (amount_in, state) = self.derive_exact_lp_input(
-            pool, input_token, output_token, lp_out, amount_in_max,
-        )?;
-        let r = self.execute_zap_to_lp_with_state(
-            pool, input_token, output_token, amount_in, lp_out, &state,
-        )?;
-        let stake_resp = self.call_staking(
-            staking, r.pool, r.lp_received, lock_duration,
-        )?;
-        Ok(Self::package_zap_response(r, stake_resp.alkanes.0, &stake_resp.data))
-    }
-
-    // ── ZapIn + Bond for exact LP (opcode 10) ────────────────────────
-
-    #[allow(clippy::too_many_arguments)] // signature fixed by the opcode ABI
-    fn zap_in_and_bond_for_exact_lp(
-        &self,
-        pool: AlkaneId,
-        input_token: AlkaneId,
-        output_token: AlkaneId,
-        lp_out: u128,
-        amount_in_max: u128,
-        bonding: AlkaneId,
-        min_fire_out: u128,
-        deadline: u128,
-    ) -> Result<CallResponse> {
-        self.check_deadline(deadline)?;
-        if input_token == output_token {
-            return Err(anyhow!("input_token == output_token"));
-        }
-        let (amount_in, state) = self.derive_exact_lp_input(
-            pool, input_token, output_token, lp_out, amount_in_max,
-        )?;
-        let r = self.execute_zap_to_lp_with_state(
-            pool, input_token, output_token, amount_in, lp_out, &state,
-        )?;
-        let bond_resp = self.call_bonding(
-            bonding, r.pool, r.lp_received, min_fire_out,
-        )?;
-        Ok(Self::package_zap_response(r, bond_resp.alkanes.0, &bond_resp.data))
+        Ok(Self::package_zap_response(r, lp))
     }
 
     // ── Standalone Stake (opcode 7) ──────────────────────────────────

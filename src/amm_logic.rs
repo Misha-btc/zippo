@@ -95,6 +95,66 @@ pub fn calculate_single_side_swap(
     s.min(amount_in.saturating_sub(1))
 }
 
+/// Proportional deposit cap: given what the zap holds after the swap
+/// (`have_in`, `have_out`) and the post-swap reserves, cap one side so
+/// the pair matches the pool ratio exactly — otherwise `AddLiquidity`
+/// would silently keep the excess.
+///
+/// Single source of truth for both the live zap path
+/// (`execute_zap_to_lp_with_state`) and `predict_lp_for_amount_in`:
+/// the exact-LP guarantee relies on prediction and execution using
+/// identical integer math, so this cap must never be duplicated.
+pub fn plan_deposit(
+    have_in: u128,
+    have_out: u128,
+    new_reserve_in: u128,
+    new_reserve_out: u128,
+) -> (u128, u128) {
+    let out_for_in = mul_div(have_in, new_reserve_out, new_reserve_in);
+    if out_for_in <= have_out {
+        (have_in, out_for_in)
+    } else {
+        (mul_div(have_out, new_reserve_in, new_reserve_out), have_out)
+    }
+}
+
+/// Forward LP prediction: exactly replicate the integer math the zap +
+/// pool execute for a given `amount_in` (optimal-split swap with floor,
+/// proportional deposit cap via `mul_div` floor, LP mint =
+/// `min(floor(dep_in·ts/R_in'), floor(dep_out·ts/R_out'))`).
+///
+/// Used by `calculate_amount_in_for_exact_lp` to correct the
+/// closed-form result: the continuous inverse cannot account for the
+/// cascaded floors, so the actual mint can undershoot the target by a
+/// couple of LP units.
+pub fn predict_lp_for_amount_in(
+    amount_in: u128,
+    reserve_in: u128,
+    reserve_out: u128,
+    total_supply: u128,
+    fee_per_1000: u128,
+) -> Result<u128> {
+    let s = calculate_single_side_swap(amount_in, reserve_in, fee_per_1000);
+    if s == 0 {
+        return Err(anyhow!("amount_in too small to split"));
+    }
+    let out = calculate_swap_out(s, reserve_in, reserve_out, fee_per_1000)?;
+    if out == 0 || out >= reserve_out {
+        return Err(anyhow!("swap output degenerate"));
+    }
+    let keep = amount_in - s;
+    let new_r_in = reserve_in
+        .checked_add(s)
+        .ok_or_else(|| anyhow!("reserve_in overflow"))?;
+    let new_r_out = reserve_out - out;
+
+    let (dep_in, dep_out) = plan_deposit(keep, out, new_r_in, new_r_out);
+    let lp_a = U256::from(dep_in) * U256::from(total_supply) / U256::from(new_r_in);
+    let lp_b = U256::from(dep_out) * U256::from(total_supply) / U256::from(new_r_out);
+    let lp = if lp_a < lp_b { lp_a } else { lp_b };
+    Ok(lp.try_into()?)
+}
+
 /// Inverse zap: given a target `lp_out`, find the exact `swap_amount`
 /// and `amount_in` that make the pool mint exactly `lp_out` LP.
 ///
@@ -104,12 +164,17 @@ pub fn calculate_single_side_swap(
 ///   `A_in = s + L · (R_in + s) / ts`,
 /// where `a' = 1000 − fee_per_1000`.
 ///
-/// Rounding: both results are rounded UP so the pool mints ≥ `lp_out`
-/// (the surplus comes back as a tiny dust refund). This is safe for the
-/// caller — `amount_in_max` catches any overshoot.
+/// Rounding: both results are rounded UP, then the result is verified
+/// with `predict_lp_for_amount_in` (the pool executes three cascaded
+/// integer floors that the continuous formula cannot see, which can
+/// shave 1–2 LP off the target) and `amount_in` is bumped until the
+/// predicted mint is ≥ `lp_out`. The surplus comes back as a tiny dust
+/// refund. This is safe for the caller — `amount_in_max` catches any
+/// overshoot.
 pub fn calculate_amount_in_for_exact_lp(
     lp_out: u128,
     reserve_in: u128,
+    reserve_out: u128,
     total_supply: u128,
     fee_per_1000: u128,
 ) -> Result<(u128, u128)> {
@@ -118,6 +183,9 @@ pub fn calculate_amount_in_for_exact_lp(
     }
     if reserve_in == 0 {
         return Err(anyhow!("pool input-side reserve is zero"));
+    }
+    if reserve_out == 0 {
+        return Err(anyhow!("pool output-side reserve is zero"));
     }
     if total_supply == 0 {
         return Err(anyhow!("pool total_supply is zero"));
@@ -143,9 +211,30 @@ pub fn calculate_amount_in_for_exact_lp(
     let a_in_part = l * ri_plus_s;
     let a_in_part_div = (a_in_part + ts - one) / ts;
     let a_in_u512 = s + a_in_part_div;
-    let amount_in: u128 = a_in_u512.try_into().map_err(|_| anyhow!("amount_in overflow u128"))?;
+    let mut amount_in: u128 =
+        a_in_u512.try_into().map_err(|_| anyhow!("amount_in overflow u128"))?;
 
-    Ok((amount_in, s_u128))
+    // Forward-check correction: the pool's floor cascade can mint 1–2
+    // LP less than the continuous formula predicts. Bump amount_in
+    // until the exact forward replica yields ≥ lp_out. The deficit is
+    // tiny, so the proportional step converges in 1–2 iterations; the
+    // bound is a hard safety net, not an expected path.
+    for _ in 0..16 {
+        let predicted =
+            predict_lp_for_amount_in(amount_in, reserve_in, reserve_out, total_supply, fee_per_1000)?;
+        if predicted >= lp_out {
+            return Ok((amount_in, s_u128));
+        }
+        let deficit = lp_out - predicted;
+        let step = mul_div(deficit, amount_in, lp_out).max(1);
+        amount_in = amount_in
+            .checked_add(step)
+            .ok_or_else(|| anyhow!("amount_in overflow u128"))?;
+    }
+    Err(anyhow!(
+        "could not converge on amount_in for lp_out {} (pool rounding)",
+        lp_out
+    ))
 }
 
 /// Inverse ZapOut: given a target `output_amount`, find the minimum
@@ -529,6 +618,42 @@ mod tests {
         assert_dust_below(u128::MAX / 4, u128::MAX / 2, u128::MAX / 2, 10, 100);
     }
 
+    // ── plan_deposit ──
+
+    #[test]
+    fn plan_deposit_caps_input_side() {
+        // have_in is the surplus side: out_for_in (10·1000/1000=10) > have_out=5
+        // → cap input to in_for_out = 5·1000/1000 = 5.
+        assert_eq!(plan_deposit(10, 5, 1000, 1000), (5, 5));
+    }
+
+    #[test]
+    fn plan_deposit_caps_output_side() {
+        // have_out is the surplus side: out_for_in = 5 ≤ have_out=10 → (5, 5).
+        assert_eq!(plan_deposit(5, 10, 1000, 1000), (5, 5));
+    }
+
+    #[test]
+    fn plan_deposit_never_exceeds_holdings() {
+        // Property over a few asymmetric states: deposits stay within
+        // what we hold, and the capped pair matches the pool ratio
+        // (dep_out = floor(dep_in · r_out / r_in) or vice versa).
+        for &(hi, ho, ri, ro) in &[
+            (1_000u128, 1u128, 1_000_000u128, 3_000_000u128),
+            (1, 1_000, 3_000_000, 1_000_000),
+            (12_345, 67_890, 111_111, 222_222),
+            (u128::MAX / 4, u128::MAX / 8, u128::MAX / 2, u128::MAX / 2),
+        ] {
+            let (d_in, d_out) = plan_deposit(hi, ho, ri, ro);
+            assert!(d_in <= hi && d_out <= ho, "deposit exceeds holdings");
+            assert!(
+                d_out == mul_div(d_in, ro, ri) || d_in == mul_div(d_out, ri, ro),
+                "capped pair off pool ratio: ({}, {}) vs reserves ({}, {})",
+                d_in, d_out, ri, ro
+            );
+        }
+    }
+
     // ── calculate_amount_in_for_exact_lp ──
 
     /// Forward/inverse consistency: given amount_in, compute LP via
@@ -555,7 +680,16 @@ mod tests {
 
         // INVERSE: given L, find required A_in. Should be ≈ original.
         let (amount_in_inv, s_inv) =
-            calculate_amount_in_for_exact_lp(lp_forward, r_in, ts, fee).unwrap();
+            calculate_amount_in_for_exact_lp(lp_forward, r_in, r_out, ts, fee).unwrap();
+
+        // The forward-checked inverse must actually mint ≥ L.
+        let minted =
+            predict_lp_for_amount_in(amount_in_inv, r_in, r_out, ts, fee).unwrap();
+        assert!(
+            minted >= lp_forward,
+            "inverse A_in {} mints {} < target {}",
+            amount_in_inv, minted, lp_forward
+        );
 
         // Required input must be ≤ original (we round UP slightly, so could be
         // a hair higher; let it within 0.1% slack).
@@ -601,10 +735,11 @@ mod tests {
 
     #[test]
     fn inverse_errors_on_zero() {
-        assert!(calculate_amount_in_for_exact_lp(0, 1000, 1000, 10).is_err());
-        assert!(calculate_amount_in_for_exact_lp(100, 0, 1000, 10).is_err());
-        assert!(calculate_amount_in_for_exact_lp(100, 1000, 0, 10).is_err());
-        assert!(calculate_amount_in_for_exact_lp(100, 1000, 1000, 1000).is_err()); // fee=1000 → a'=0
+        assert!(calculate_amount_in_for_exact_lp(0, 1000, 1000, 1000, 10).is_err());
+        assert!(calculate_amount_in_for_exact_lp(100, 0, 1000, 1000, 10).is_err());
+        assert!(calculate_amount_in_for_exact_lp(100, 1000, 0, 1000, 10).is_err());
+        assert!(calculate_amount_in_for_exact_lp(100, 1000, 1000, 0, 10).is_err());
+        assert!(calculate_amount_in_for_exact_lp(100, 1000, 1000, 1000, 1000).is_err()); // fee=1000 → a'=0
     }
 
     #[test]
@@ -612,11 +747,75 @@ mod tests {
         // L·1000·R_in ≈ 2^266 — wrapped silently in the old U256 version.
         let big = 1u128 << 126;
         let (amount_in, s) =
-            calculate_amount_in_for_exact_lp(big, big, big, 10).unwrap();
+            calculate_amount_in_for_exact_lp(big, big, big, big, 10).unwrap();
         assert!(s > 0 && amount_in > s);
         // Minting 100% of supply against an equal reserve needs
         // ~3.02·R_in input (s ≈ 1.01·R, deposit ≈ 2.01·R).
         assert!(amount_in / big == 3, "amount_in = {}", amount_in);
+        // Forward check holds at u128 scale too.
+        let minted = predict_lp_for_amount_in(amount_in, big, big, big, 10).unwrap();
+        assert!(minted >= big, "minted {} < target {}", minted, big);
+    }
+
+    #[test]
+    fn inverse_exact_lp_regtest_undershoot_regression() {
+        // Exact pool state from regtest where the pure closed-form
+        // undershot: lp_out=100_000 produced a mint of 99_998 and the
+        // on-chain tx reverted with "insufficient LP". The forward-check
+        // loop must bump amount_in until the predicted mint covers the
+        // target.
+        let lp_out = 100_000u128;
+        let r_in = 100_999_997u128;
+        let r_out = 100_000_000u128;
+        let ts = 100_431_211u128;
+        let fee = 10u128;
+
+        let (amount_in, _) =
+            calculate_amount_in_for_exact_lp(lp_out, r_in, r_out, ts, fee).unwrap();
+        let minted = predict_lp_for_amount_in(amount_in, r_in, r_out, ts, fee).unwrap();
+        assert!(
+            minted >= lp_out,
+            "minted {} < target {} (amount_in {})",
+            minted, lp_out, amount_in
+        );
+        // Overshoot stays microscopic — we don't blow past the target.
+        assert!(minted <= lp_out + 10, "minted {} overshoots target {}", minted, lp_out);
+    }
+
+    /// Sweep many (lp_out, state) combinations and require the
+    /// forward-checked inverse to always reach the target mint.
+    #[test]
+    fn inverse_exact_lp_always_mints_enough() {
+        let states: [(u128, u128, u128); 6] = [
+            (100_999_997, 100_000_000, 100_431_211), // regtest snapshot
+            (100_000_000, 100_000_000, 100_000_000),
+            (200_000_000, 50_000_000, 100_000_000),
+            (1_234_567_891, 987_654_321, 1_103_456_789),
+            (10_000, 10_000, 10_000),
+            (1u128 << 100, 1u128 << 99, 1u128 << 99),
+        ];
+        for &(r_in, r_out, ts) in &states {
+            for &lp_out in &[1u128, 7, 100, 99_999, 100_000, 100_001, 400_000, ts / 100] {
+                if lp_out == 0 {
+                    continue;
+                }
+                let res = calculate_amount_in_for_exact_lp(lp_out, r_in, r_out, ts, 10);
+                let (amount_in, _) = match res {
+                    Ok(v) => v,
+                    // Tiny lp_out against huge pools can be legitimately
+                    // unreachable (amount_in too small to split) — that
+                    // is an explicit error, not a silent undershoot.
+                    Err(_) => continue,
+                };
+                let minted =
+                    predict_lp_for_amount_in(amount_in, r_in, r_out, ts, 10).unwrap();
+                assert!(
+                    minted >= lp_out,
+                    "minted {} < lp_out {} (r_in={}, r_out={}, ts={}, amount_in={})",
+                    minted, lp_out, r_in, r_out, ts, amount_in
+                );
+            }
+        }
     }
 
     // ── calculate_lp_for_exact_out (ZapOut inverse) ──
