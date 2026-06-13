@@ -1,4 +1,5 @@
 # zippo
+mainnet: 4:6666
 
 Single-side zap + stake/bond router for oyl-amm pools on ALKANES.
 
